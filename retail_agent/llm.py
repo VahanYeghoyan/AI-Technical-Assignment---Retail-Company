@@ -59,7 +59,20 @@ class LLMQuotaError(LLMError):
 
 
 class LLMConfigError(LLMError):
-    """Bad key, wrong project, retired model with no working fallback."""
+    """Bad key, bad project, or a malformed request. Fatal — no fallback.
+
+    Sending the same malformed request to a second model just doubles the cost
+    of failing.
+    """
+
+
+class LLMModelUnavailableError(LLMConfigError):
+    """THIS model cannot serve the request, but another one might.
+
+    The case that matters: Gemini retires models for new keys and answers 404
+    with "no longer available". Falling back to the configured secondary is the
+    correct response — unlike a 400, where the request itself is wrong.
+    """
 
 
 class LLMBudgetError(LLMError):
@@ -70,6 +83,12 @@ class LLMBudgetError(LLMError):
 class FunctionCall:
     name: str
     args: dict[str, Any]
+    # Gemini 3.x returns an opaque thought_signature alongside each function
+    # call, and REQUIRES it to be echoed back verbatim when that call appears in
+    # conversation history. Drop it and the next request fails with
+    # "400 Function call is missing a thought_signature in functionCall parts",
+    # which means every tool-using turn dies on its second model call.
+    thought_signature: Any = None
 
 
 @dataclass(frozen=True)
@@ -128,11 +147,17 @@ def _classify_genai(err: Exception) -> LLMError:
             )
         return LLMTransientError(message)
 
+    if code == 400 or "invalid_argument" in lowered:
+        # A malformed request is our bug, not the service's. Retrying it spends
+        # the turn's entire call budget on an error that cannot change — which
+        # is exactly how a self-correction loop turns into a cost incident.
+        return LLMConfigError(message)
+
     if code in {401, 403} or "api key not valid" in lowered or "permission" in lowered:
         return LLMConfigError(message)
 
     if code == 404 or "not found" in lowered or "no longer available" in lowered:
-        return LLMConfigError(message)
+        return LLMModelUnavailableError(message)
 
     if isinstance(err, genai_errors.APIError):
         return LLMTransientError(message)
@@ -142,9 +167,31 @@ def _classify_genai(err: Exception) -> LLMError:
 
 @dataclass
 class GeminiProvider:
-    """google-genai backed provider with model fallback and retries."""
+    """google-genai backed provider with model fallback and retries.
+
+    Two backends, same wire format:
+
+      AI Studio  an API key. Simplest to obtain, but the free tier is small and
+                 a depleted key returns 429 on every model.
+      Vertex AI  Application Default Credentials against a GCP project. No API
+                 key at all, billed through the project, and it reuses the same
+                 credentials BigQuery already needs — so a deployment that can
+                 read the warehouse can also reach the model.
+
+    Vertex is the better production answer regardless: keys do not have to be
+    minted, stored or rotated, and access is IAM rather than a bearer secret.
+    """
 
     api_key: str | None = None
+    use_vertex: bool = field(
+        default_factory=lambda: os.getenv("LLM_PROVIDER", "").lower() == "vertex"
+    )
+    project: str | None = field(
+        default_factory=lambda: os.getenv("GOOGLE_CLOUD_PROJECT")
+    )
+    location: str = field(
+        default_factory=lambda: os.getenv("VERTEX_LOCATION", "global")
+    )
     model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", DEFAULT_MODEL))
     fallback_model: str = field(
         default_factory=lambda: os.getenv(
@@ -160,16 +207,37 @@ class GeminiProvider:
     _calls_this_turn: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
-        if self.client is None:
-            from google import genai
+        if self.client is not None:
+            return
 
-            key = self.api_key or os.getenv("GOOGLE_API_KEY")
-            if not key:
+        from google import genai
+
+        if self.use_vertex:
+            if not self.project:
                 raise LLMConfigError(
-                    "GOOGLE_API_KEY is not set. Copy .env.example to .env and add a "
-                    "Google AI Studio key, or set LLM_PROVIDER=stub to run offline."
+                    "LLM_PROVIDER=vertex needs GOOGLE_CLOUD_PROJECT set, and "
+                    "Application Default Credentials "
+                    "(`gcloud auth application-default login`)."
                 )
-            self.client = genai.Client(api_key=key)
+            try:
+                self.client = genai.Client(
+                    vertexai=True, project=self.project, location=self.location
+                )
+            except Exception as err:  # noqa: BLE001
+                raise LLMConfigError(
+                    f"could not reach Vertex AI in project {self.project!r}: {err}. "
+                    "Enable it with `gcloud services enable aiplatform.googleapis.com`."
+                ) from err
+            return
+
+        key = self.api_key or os.getenv("GOOGLE_API_KEY")
+        if not key:
+            raise LLMConfigError(
+                "GOOGLE_API_KEY is not set. Copy .env.example to .env and add a "
+                "Google AI Studio key, set LLM_PROVIDER=vertex to use Application "
+                "Default Credentials instead, or LLM_PROVIDER=stub to run offline."
+            )
+        self.client = genai.Client(api_key=key)
 
     def begin_turn(self) -> None:
         """Reset the per-turn call budget."""
@@ -203,9 +271,11 @@ class GeminiProvider:
                     tools=tools,
                     used_fallback=index > 0,
                 )
-            except LLMConfigError as err:
-                # A retired or unavailable model: try the next one rather than
-                # failing the turn.
+            except LLMModelUnavailableError as err:
+                # This model is retired or unavailable: try the next one rather
+                # than failing the turn. Note this does NOT catch plain
+                # LLMConfigError — a malformed request or a bad key fails the
+                # same way on every model, so falling back would only pay twice.
                 last = err
                 continue
             except LLMQuotaError:
@@ -277,7 +347,13 @@ def _parse_response(response: Any, *, model: str, used_fallback: bool) -> LLMRes
             call = getattr(part, "function_call", None)
             if call is not None:
                 calls.append(
-                    FunctionCall(name=call.name, args=dict(call.args or {}))
+                    FunctionCall(
+                        name=call.name,
+                        args=dict(call.args or {}),
+                        # Carried on the PART, not the call, and opaque to us —
+                        # it must survive the round trip untouched.
+                        thought_signature=getattr(part, "thought_signature", None),
+                    )
                 )
 
     usage = getattr(response, "usage_metadata", None)
@@ -338,8 +414,14 @@ class StubProvider:
 def build_provider(**kwargs: Any) -> LLMProvider:
     """Pick a provider from the environment.
 
-    LLM_PROVIDER=stub runs the whole agent with no network and no quota.
+    LLM_PROVIDER:
+      stub    no network, no quota — the whole agent runs offline
+      vertex  Vertex AI via Application Default Credentials (no API key)
+      gemini  AI Studio API key (default)
     """
-    if os.getenv("LLM_PROVIDER", "gemini").lower() == "stub":
+    choice = os.getenv("LLM_PROVIDER", "gemini").lower()
+    if choice == "stub":
         return StubProvider(**kwargs)
+    if choice == "vertex":
+        kwargs.setdefault("use_vertex", True)
     return GeminiProvider(**kwargs)

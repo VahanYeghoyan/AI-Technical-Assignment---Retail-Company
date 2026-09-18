@@ -29,8 +29,13 @@ from tests.test_resilience import FakeBQClient, runner as bq_runner
 WOMENS = Scope(user_id="maya", display_name="Maya Cohen", departments=frozenset({"Women"}))
 
 
-def call(name, **args) -> LLMResponse:
-    return LLMResponse(function_calls=(FunctionCall(name=name, args=args),), model="stub")
+def call(name, _signature=None, **args) -> LLMResponse:
+    return LLMResponse(
+        function_calls=(
+            FunctionCall(name=name, args=args, thought_signature=_signature),
+        ),
+        model="stub",
+    )
 
 
 def text(body: str) -> LLMResponse:
@@ -97,6 +102,48 @@ def test_scope_is_enforced_on_the_agents_own_queries(tmp_path, store):
 
     # The model wrote an unscoped query; what actually ran is scoped.
     assert "department IN ('Women')" in client.executed[0]
+
+
+def test_thought_signature_is_echoed_back_into_history(tmp_path, store):
+    # The agent-side half of the live-only bug: Gemini 3.x rejects history whose
+    # functionCall parts lost their thought_signature, so a tool-using turn died
+    # on its second model call. Every test passed regardless, because the stub
+    # provider never validated history.
+    agent = build(
+        tmp_path,
+        store,
+        [
+            call("describe_schema", _signature=b"sig-xyz"),
+            text("Four tables are available."),
+        ],
+    )
+
+    agent.ask("what data do you have?")
+
+    call_parts = [
+        part
+        for message in agent.history
+        for part in message.get("parts", [])
+        if "function_call" in part
+    ]
+    assert call_parts, "the tool call should be in history"
+    assert call_parts[0]["thought_signature"] == b"sig-xyz"
+
+
+def test_history_omits_thought_signature_when_absent(tmp_path, store):
+    # AI Studio / older models return no signature; sending a null one back
+    # would be just as invalid as dropping a real one.
+    agent = build(tmp_path, store, [call("describe_schema"), text("done")])
+
+    agent.ask("what data do you have?")
+
+    call_parts = [
+        part
+        for message in agent.history
+        for part in message.get("parts", [])
+        if "function_call" in part
+    ]
+    assert "thought_signature" not in call_parts[0]
 
 
 def test_describe_schema_needs_no_database(tmp_path, store):

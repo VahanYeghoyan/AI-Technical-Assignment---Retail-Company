@@ -325,9 +325,12 @@ class FakeGenAIClient:
 
 
 class _Part:
-    def __init__(self, text=None, function_call=None):
+    def __init__(self, text=None, function_call=None, thought_signature=None):
         self.text = text
         self.function_call = function_call
+        # Gemini 3.x attaches this to the PART carrying a function call, and
+        # requires it back verbatim in history.
+        self.thought_signature = thought_signature
 
 
 class _Call:
@@ -336,8 +339,14 @@ class _Call:
         self.args = args
 
 
-def _fake_genai_response(text="", call=None, prompt_tokens=10, output_tokens=5):
-    part = _Part(text=text) if text else _Part(function_call=call)
+def _fake_genai_response(
+    text="", call=None, prompt_tokens=10, output_tokens=5, signature=None
+):
+    part = (
+        _Part(text=text)
+        if text
+        else _Part(function_call=call, thought_signature=signature)
+    )
     candidate = type("C", (), {"content": type("Ct", (), {"parts": [part]})()})()
     usage = type(
         "U",
@@ -372,6 +381,40 @@ def test_gemini_parses_tool_calls():
     assert response.function_calls[0] == FunctionCall(
         name="run_analysis_sql", args={"sql": "SELECT 1"}
     )
+
+
+def test_thought_signature_is_captured_from_the_response():
+    # Gemini 3.x requires this opaque token back verbatim when the call appears
+    # in history. Dropping it made every tool-using turn die on its SECOND model
+    # call with "400 Function call is missing a thought_signature".
+    call = _Call("run_analysis_sql", {"sql": "SELECT 1"})
+    provider = gemini([_fake_genai_response(call=call, signature=b"sig-abc123")])
+
+    response = provider.generate(system="s", contents=[])
+
+    assert response.function_calls[0].thought_signature == b"sig-abc123"
+
+
+def test_malformed_request_is_fatal_with_no_retry_and_no_fallback():
+    # A 400 means our request is wrong. Retrying it, or re-sending it to the
+    # fallback model, only pays twice to fail the same way.
+    from google.genai import errors as genai_errors
+
+    bad = genai_errors.ClientError(
+        400,
+        {"error": {"message": "INVALID_ARGUMENT: Function call is missing a "
+                              "thought_signature in functionCall parts"}},
+    )
+    provider = gemini(
+        [bad, _fake_genai_response("never reached")],
+        model="gemini-3.6-flash",
+        fallback_model="gemini-3.1-flash-lite",
+    )
+
+    with pytest.raises(LLMConfigError):
+        provider.generate(system="s", contents=[])
+
+    assert provider.client.models.calls == ["gemini-3.6-flash"]
 
 
 def test_gemini_retries_transient_server_errors():

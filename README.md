@@ -23,9 +23,14 @@ implements in design only.
 | Quality assurance | Design only |
 | Agility (persona) | Implemented (hot-reload) + design |
 
-**111 tests pass with no credentials and no LLM quota.** That is deliberate: the
+**121 tests pass with no credentials and no LLM quota.** That is deliberate: the
 safety and oversight guarantees are the ones that must be verifiable in CI on any
 machine, without reaching a third party.
+
+Separately, the full path has been verified live against Vertex AI Gemini 3.6
+Flash and BigQuery — including entitlement rewriting on the real warehouse
+(a Women's-scoped user asking explicitly for Men's revenue gets an empty result,
+not an error and not data).
 
 ---
 
@@ -56,14 +61,27 @@ Any project with the BigQuery API enabled works; the free sandbox is sufficient,
 and queries against the public dataset are billed to your project (~1 TB/month
 free). Every query here is dry-run and capped well below that.
 
-### 3. Gemini API key
-
-Get one from [Google AI Studio](https://aistudio.google.com/apikey), then:
+### 3. Model access
 
 ```bash
 cp .env.example .env
-# edit .env and set GOOGLE_API_KEY
 ```
+
+Two options. **Vertex AI is recommended and needs no API key** — it reuses the
+Application Default Credentials you just set up, so anything that can read the
+warehouse can also reach the model, and access is IAM rather than a bearer
+secret that has to be minted, stored and rotated:
+
+```bash
+gcloud services enable aiplatform.googleapis.com
+# .env: LLM_PROVIDER=vertex
+```
+
+Or an [AI Studio](https://aistudio.google.com/apikey) key
+(`LLM_PROVIDER=gemini`, `GOOGLE_API_KEY=…`). Be aware its free tier is small and
+returns `429 Your prepayment credits are depleted` on *every* model once spent —
+which is what happened during this project's development, and is why the offline
+stub below exists.
 
 ### 4. Run
 
@@ -87,34 +105,55 @@ requirement — and because this project's API key hit
 
 ## Example session
 
+Real output, signed in as `maya` (VP, Women's Division) against live Vertex
+Gemini 3.6 Flash and live BigQuery:
+
 ```
-› /whoami
-╭─ whoami ─────────────────────────────────────────╮
-│ Maya Cohen — VP, Women's Division                 │
-│ Scope: department in ['Women']                    │
-│ Persona version: 3                                │
-╰───────────────────────────────────────────────────╯
+› What were my top 3 brands by revenue this year?
 
-› compare revenue for Calvin Klein and Levi's
+Jones New York generated the highest net revenue in the Women's Division
+year-to-date, delivering $21,167.40, followed by True Religion ($18,517.00)
+and Calvin Klein ($17,189.20).
 
-Calvin Klein leads at $48,210 vs Levi's $39,102 — a 23% gap.
-Data through 2026-09-18, realised revenue (excl. cancelled/returned).
+Year-to-Date Brand Performance (Women's Division)
+Date range: January 1, 2026 through September 18, 2026
+Metric: Net Revenue = SUM(sale_price) excluding Cancelled and Returned orders
 
-› save that as a report
-Saved report 7cbc6d97  (/reports to list)
+| Brand           | Net Revenue | Gross Margin | Units Sold | Avg Price/Unit |
+| :-------------- | ----------: | -----------: | ---------: | -------------: |
+| Jones New York  |  $21,167.40 |   $11,311.70 |        217 |         $97.55 |
+| True Religion   |  $18,517.00 |    $8,732.45 |         89 |        $208.06 |
+| Calvin Klein    |  $17,189.20 |    $9,035.74 |        279 |         $61.61 |
 
-› delete all reports mentioning Levi's
+Key Observations
+• Volume vs. Price Realization: True Religion achieved its revenue rank on high
+  price points ($208.06 average unit price) with only 89 units sold. Calvin
+  Klein drove revenue through volume (279 units) at $61.61 per unit.
+• Margin Efficiency: Jones New York delivered the highest absolute gross margin
+  ($11,311.70, a 53.4% margin rate), outperforming True Religion (47.2%).
 
-This will delete 1 saved report(s) matching "mentioning Levi's":
-
-  • [7cbc6d97] Denim brand performance — 2026-09-18
-
-Deletes are reversible for 30 days (/undo).
-Type 'yes' to confirm. Anything else cancels.
-
-› yes
-Deleted 1 report(s). /undo restores them.
+[status=ok llm=2 sql=1 corrections=0 tok=7088->687 bytes=10,055,935]
 ```
+
+Note it volunteered the metric definition and the date range unprompted — those
+come from `config/metrics.yaml` and `config/persona.yaml`, not from the question.
+
+A PII request, same session:
+
+```
+› Who is the customer with email alice@example.com?
+
+Customer email addresses and personal details are restricted for privacy
+protection; this assistant analyzes aggregate sales, product performance, and
+customer cohort metrics.
+
+I can, however, show you customer spending distribution by tier or churn rates
+across acquisition channels for the Women's Division.
+```
+
+That refusal came from the model, but it is not what enforces the rule: had it
+tried, the SQL guard would have rejected any query touching `email` before it
+reached BigQuery.
 
 Maya is scoped to the Women's department, so the SQL that actually reached
 BigQuery was not the SQL the model wrote:

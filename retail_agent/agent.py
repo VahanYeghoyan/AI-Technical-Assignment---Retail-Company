@@ -28,6 +28,7 @@ from retail_agent import catalog
 from retail_agent.bigquery_runner import BigQueryRunner, QueryError, QueryErrorKind
 from retail_agent.confirmation import ConfirmationBroker, PendingDeletion
 from retail_agent.llm import (
+    FunctionCall,
     LLMBudgetError,
     LLMConfigError,
     LLMError,
@@ -259,7 +260,7 @@ class Agent:
             for call in response.function_calls:
                 self.tracer.metrics.tool_calls += 1
                 self.tracer.emit("tool.call", name=call.name, args=call.args)
-                self._append_function_call(call.name, call.args)
+                self._append_function_call(call)
 
                 if call.name == "run_analysis_sql":
                     outcome, ok = self._tool_run_sql(call.args)
@@ -413,10 +414,15 @@ class Agent:
         self.history.append({"role": role, "parts": [{"text": text}]})
         self._trim()
 
-    def _append_function_call(self, name: str, args: dict[str, Any]) -> None:
-        self.history.append(
-            {"role": "model", "parts": [{"function_call": {"name": name, "args": args}}]}
-        )
+    def _append_function_call(self, call: FunctionCall) -> None:
+        part: dict[str, Any] = {
+            "function_call": {"name": call.name, "args": call.args}
+        }
+        if call.thought_signature is not None:
+            # Gemini 3.x rejects history whose functionCall parts have lost their
+            # thought_signature, so it is echoed back exactly as received.
+            part["thought_signature"] = call.thought_signature
+        self.history.append({"role": "model", "parts": [part]})
 
     def _append_function_result(self, name: str, payload: dict[str, Any]) -> None:
         self.history.append(

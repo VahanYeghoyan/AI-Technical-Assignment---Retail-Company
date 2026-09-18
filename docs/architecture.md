@@ -88,6 +88,7 @@ flowchart TB
 |---|---|---|
 | Compute | **Cloud Run** | Request-shaped, bursty, scales to zero. A chat turn is seconds of CPU; GKE's operational weight buys nothing here. |
 | Model | **Gemini 3.6 Flash**, fallback **3.1 Flash-Lite** | Verified live on 2026-09-18; 2.5-* are retired for new keys and the API redirects to 3.6. Flash is the right tier for SQL generation and summarisation; Pro is reserved for multi-step "why" analyses if eval justifies the cost. |
+| Model access | **Vertex AI via ADC**, not an AI Studio key | Access becomes IAM rather than a bearer secret — no key to mint, store, rotate or leak, and the workload already needs those credentials for BigQuery. It also bills through the project rather than a prepaid pool that fails closed on every model at once, which is precisely what happened to this project's AI Studio key mid-build. |
 | Warehouse | **BigQuery** | The dataset is already there; separation of storage and compute means per-query cost caps are enforceable server-side. |
 | Access control | **Authorized views + row-level access policies** | Moves entitlements *into* the database. The agent then cannot over-read even if the application layer is compromised. |
 | Golden Bucket | **GCS** (trios) + **Vertex AI Vector Search** (index) | Trios are documents; retrieval is nearest-neighbour. Vector Search handles scale and filtered queries; for <100k trios, BigQuery `VECTOR_SEARCH` is the cheaper option and avoids a service. |
@@ -228,6 +229,29 @@ Implemented — classification table in the README. In production additionally:
 regional Cloud Run failover, a Gemini→Vertex AI endpoint fallback for provider-
 level outages, request hedging on p99 latency, and idempotency keys so a retried
 report-save cannot duplicate.
+
+**Two failure modes worth recording, because both were invisible to a fully
+green test suite and only appeared against live services.**
+
+*Thought signatures.* Gemini 3.x returns an opaque `thought_signature` on each
+function-call part and requires it echoed back verbatim when that call appears in
+history. Drop it and the next request fails with
+`400 Function call is missing a thought_signature`. The shape of the bug matters:
+the first model call succeeds, the tool runs, BigQuery is queried and billed, and
+only the *second* call dies — so every tool-using turn failed after doing all the
+expensive work. A stub provider cannot catch this, because a stub never
+validates history. Anything that round-trips provider state through our own
+conversation format needs a contract test against the real API.
+
+*Not every 4xx deserves a retry.* Both dependencies produced a 400 that was
+initially classified as retryable or self-correctable — BigQuery's malformed job
+configuration, and the missing signature above. Each would have spent the turn's
+entire budget re-sending a request that could never succeed. The rule adopted
+throughout: **a 400 means our request is wrong, so it is fatal — never retried,
+never sent to a fallback model, never handed to the LLM as "fix your SQL".**
+Retries are reserved for 5xx, timeouts and rate limits. Misclassifying here is
+how a self-correction loop quietly becomes a cost incident, which is the exact
+failure Requirement 5 warns about.
 
 ### 3.6 Quality assurance
 
