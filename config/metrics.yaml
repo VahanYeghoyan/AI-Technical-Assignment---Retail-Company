@@ -1,0 +1,102 @@
+# METRIC GLOSSARY
+#
+# The questions in the brief ("why is state X underspending", "why did churn
+# spike") use business terms that have no definition in thelook_ecommerce. Left
+# undefined, the model invents a definition per question and two answers to the
+# same question disagree. This file pins them down.
+#
+# The agent MUST use these definitions, and MUST state the definition it used in
+# any answer that reports one of these metrics. In production this file is the
+# seed of the semantic layer and is versioned alongside the Golden Bucket.
+
+version: 2
+updated_at: 2026-09-18
+
+# ---------------------------------------------------------------------------
+# Dataset facts that change how every metric must be written
+# ---------------------------------------------------------------------------
+dataset_notes:
+  # Verified 2026-09-18: MAX(order_items.created_at) = 2026-09-21, which is in
+  # the FUTURE. thelook continuously generates forward-dated rows.
+  # Without a clamp, "revenue this month" silently includes sales that have not
+  # happened yet, and any trend line dives at the right edge.
+  future_dated_rows: true
+  clamp_rule: >
+    Every time filter MUST end at CURRENT_TIMESTAMP(). Never let a window run to
+    MAX(created_at). The agent states "data through <date>" in the answer.
+
+  # Verified row counts by status on order_items (180,342 rows total):
+  #   Shipped 53,770 | Complete 45,623 | Processing 36,180
+  #   Cancelled 26,968 | Returned 17,801
+  # Cancelled + Returned = 24.8% of rows. Including them overstates revenue by
+  # roughly a quarter, so the exclusion below is a material decision, not a detail.
+  status_values: [Shipped, Complete, Processing, Cancelled, Returned]
+
+# ---------------------------------------------------------------------------
+# Metric definitions
+# ---------------------------------------------------------------------------
+metrics:
+  revenue:
+    definition: SUM(order_items.sale_price)
+    filters: status NOT IN ('Cancelled', 'Returned')
+    grain: order_items
+    note: >
+      Realised revenue. 'Processing' is included because the sale is committed
+      even though it has not shipped. Say "realised revenue (excl. cancelled and
+      returned)" when reporting it.
+
+  gross_margin:
+    definition: SUM(order_items.sale_price - products.cost)
+    filters: status NOT IN ('Cancelled', 'Returned')
+    note: products.cost is unit cost; join order_items.product_id -> products.id.
+
+  average_order_value:
+    definition: revenue / COUNT(DISTINCT orders.order_id)
+    note: Compute over the same status filter as revenue, or AOV and revenue disagree.
+
+  units_sold:
+    definition: COUNT(order_items.id)
+    filters: status NOT IN ('Cancelled', 'Returned')
+
+  return_rate:
+    definition: COUNTIF(status = 'Returned') / COUNT(*)
+    grain: order_items
+    note: Denominator here intentionally INCLUDES returned and cancelled rows.
+
+  customer_spend:
+    definition: revenue grouped by order_items.user_id
+    note: >
+      Customers are reported pseudonymously (CUST-xxxxxx). Never by name or email
+      — see retail_agent/safety/pii.py.
+
+  churn:
+    # thelook has no subscriptions, so churn cannot be read off the data. It has
+    # to be defined behaviourally, and the definition drives the answer.
+    definition: >
+      A customer is churned as of date D if they placed at least one non-cancelled
+      order before D-180d, and no non-cancelled order in the 180 days ending at D.
+    window_days: 180
+    note: >
+      "Churn spiked last month" therefore means the count of customers crossing
+      that boundary in that month rose. Always report the window with the number.
+
+  underspending:
+    # "Why are users for state X underspending" — underspending versus what?
+    definition: >
+      A cohort underspends if its revenue per active customer is below the
+      all-cohort median for the same period. Always report the comparison base
+      and the cohort size alongside the gap.
+    note: >
+      Never call a difference underspending without stating the baseline, and do
+      not call a gap meaningful when the cohort has fewer than 30 customers.
+
+# ---------------------------------------------------------------------------
+# Disclosure limits
+# ---------------------------------------------------------------------------
+privacy:
+  # Blocks re-identification via slicing (e.g. "customers aged 91 in city Z").
+  min_group_size: 5
+  note: >
+    Any GROUP BY over customer-level quasi-identifiers (city, state, age, gender,
+    traffic_source) must suppress buckets with fewer than min_group_size
+    customers. The agent reports "n < 5, suppressed" rather than the value.

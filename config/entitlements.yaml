@@ -1,0 +1,59 @@
+# WHO MAY ANALYSE WHAT  (Requirement 2, "each user may only analyse data on
+# products related to him").
+#
+# thelook_ecommerce has no notion of an executive user or of product ownership,
+# so that mapping has to be supplied. This file is it.
+#
+# Every scope is expressed as a predicate over the PRODUCTS table. The SQL guard
+# (retail_agent/safety/sql_guard.py) rewrites every generated query so that all
+# four tables are filtered through that predicate before the query runs — the
+# model is never trusted to scope its own SQL.
+#
+# Reachability rules that follow from scoping on products:
+#   order_items -> only rows whose product is in scope
+#   orders      -> only orders containing at least one in-scope item
+#   users       -> only customers who bought at least one in-scope item
+#
+# Dimension values are the real ones in the dataset (verified 2026-09-18).
+# departments: Men, Women
+# An omitted/empty dimension means "no constraint on that dimension".
+# Dimensions combine with AND; values inside a dimension combine with OR.
+
+users:
+  # Full-catalogue access. The CEO persona — no product restriction.
+  ceo:
+    display_name: Dana Raviv
+    title: Chief Executive Officer
+    scope:
+      unrestricted: true
+
+  # Divisional head: everything in the Women's department.
+  maya:
+    display_name: Maya Cohen
+    title: VP, Women's Division
+    scope:
+      departments: [Women]
+
+  # Category manager: denim + swim across both departments.
+  daniel:
+    display_name: Daniel Weiss
+    title: Category Director, Denim & Swim
+    scope:
+      categories: [Jeans, Swim, Shorts]
+
+  # Brand manager: a specific vendor portfolio. Intersects with nothing else,
+  # so this user sees only Calvin Klein / Levi's products in any department.
+  priya:
+    display_name: Priya Nair
+    title: Brand Manager, Premium Denim
+    scope:
+      brands: ["Calvin Klein", "Levi's"]
+
+  # Deliberately narrow scope, used by the test suite and the demo to show that
+  # cross-scope questions get refused rather than silently answered.
+  sam:
+    display_name: Sam Ortega
+    title: Merchandiser, Men's Intimates
+    scope:
+      departments: [Men]
+      categories: [Underwear, Socks]

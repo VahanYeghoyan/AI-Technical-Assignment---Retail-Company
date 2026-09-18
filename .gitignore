@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Secrets — never commit
+.env
+
+# Local state (SQLite: saved reports, sessions, traces)
+data/*.db
+data/*.db-journal
+var/
+
+# Google Cloud SDK was unpacked inside this project directory.
+# It must never be committed (hundreds of MB of vendored tooling).
+google-cloud-sdk/
+google-cloud-cli-*.tar.gz
+
+# macOS
+.DS_Store
