@@ -1,8 +1,8 @@
 # Verified working on Python 3.14.0 (macOS, arm64) on 2026-09-18.
-# Python >= 3.13 is required: on 3.12 pip resolves google-adk to 1.14.1,
-# a much older API than the 2.x this code is written against.
+# Python >= 3.13 recommended: on 3.12, pip resolves google-genai to 1.75.0
+# rather than the 2.x this code was written and verified against.
+# Python >= 3.11 is a hard floor (datetime.UTC, StrEnum, tomllib-era syntax).
 
-google-adk==2.9.1
 google-genai==2.24.0
 google-cloud-bigquery==3.45.2
 db-dtypes>=1.4.3
