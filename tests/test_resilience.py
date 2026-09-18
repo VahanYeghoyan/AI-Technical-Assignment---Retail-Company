@@ -69,12 +69,20 @@ class FakeBQClient:
         )
         self.queries: list[str] = []
         self.executed: list[str] = []
+        # Job configs are recorded because not doing so hid a bug that broke
+        # every real query: maximum_bytes_billed=None serialises to the string
+        # "None" and BigQuery rejects the job. A fake that ignores the config
+        # cannot catch that class of defect.
+        self.dry_run_configs: list[object] = []
+        self.executed_configs: list[object] = []
 
     def query(self, sql, job_config=None):
         self.queries.append(sql)
         if job_config is not None and getattr(job_config, "dry_run", False):
+            self.dry_run_configs.append(job_config)
             return FakeJob(pd.DataFrame(), total_bytes_processed=self.dry_run_bytes)
         self.executed.append(sql)
+        self.executed_configs.append(job_config)
         if self.behaviours:
             behaviour = self.behaviours.pop(0)
             if isinstance(behaviour, Exception):
@@ -106,7 +114,43 @@ def test_query_over_the_byte_cap_is_rejected_before_it_runs():
 def test_real_job_carries_a_maximum_bytes_billed_ceiling():
     client = FakeBQClient()
     runner(client, max_bytes_billed=123_456).execute(SIMPLE_SQL, UNRESTRICTED)
+
     assert client.executed, "the query should have run"
+    assert client.executed_configs[0].maximum_bytes_billed == 123_456
+
+
+def test_dry_run_config_omits_maximum_bytes_billed():
+    # Regression: assigning None does not mean "unset". The client serialises it
+    # as the string "None" and BigQuery rejects the job with
+    # "Invalid value at 'maximum_bytes_billed' (TYPE_INT64)" — which broke every
+    # real query while the suite stayed green, because the fake ignored configs.
+    client = FakeBQClient()
+    runner(client).execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert client.dry_run_configs[0].maximum_bytes_billed is None
+    assert "maximumBytesBilled" not in client.dry_run_configs[0].to_api_repr().get(
+        "query", {}
+    )
+
+
+def test_bad_job_configuration_is_not_blamed_on_the_model():
+    # A 400 about the job config is our bug. Classifying it as a syntax error
+    # would spend the entire repair budget rewriting SQL that was never wrong.
+    client = FakeBQClient(
+        behaviours=[
+            gexc.BadRequest(
+                "Invalid value at 'job.configuration.query.maximum_bytes_billed."
+                "value' (TYPE_INT64), \"None\""
+            )
+        ]
+    )
+    with pytest.raises(QueryError) as err:
+        runner(client).execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert err.value.kind is QueryErrorKind.CONFIG
+    assert err.value.self_correctable is False
+    assert err.value.retryable is False
+    assert len(client.executed) == 1  # not retried
 
 
 def test_dry_run_happens_before_every_execution():

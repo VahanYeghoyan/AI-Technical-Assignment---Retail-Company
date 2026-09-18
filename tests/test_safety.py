@@ -131,6 +131,42 @@ def test_non_pii_user_columns_are_allowed():
 # ---------------------------------------------------------------------------
 
 
+def test_bare_table_names_are_qualified_for_unrestricted_users():
+    # Regression: BigQuery rejects `FROM orders` with "must be qualified with a
+    # dataset". Scoped users were saved by the rewrite (its subqueries are
+    # qualified), so the UNRESTRICTED user was the one that failed — backwards.
+    result = guard("SELECT COUNT(*) AS n FROM orders", UNRESTRICTED)
+    assert "`bigquery-public-data`.`thelook_ecommerce`.`orders`" in result.sql.replace(
+        "bigquery-public-data.thelook_ecommerce.orders",
+        "`bigquery-public-data`.`thelook_ecommerce`.`orders`",
+    )
+    assert "FROM orders" not in result.sql
+
+
+def test_already_qualified_tables_are_left_alone():
+    sql = "SELECT COUNT(*) AS n FROM `bigquery-public-data.thelook_ecommerce.orders`"
+    result = guard(sql, UNRESTRICTED)
+    assert result.sql.count("thelook_ecommerce") == 1
+
+
+def test_qualification_preserves_aliases():
+    sql = "SELECT o.order_id FROM orders AS o WHERE o.status = 'Complete'"
+    result = guard(sql, UNRESTRICTED)
+    assert "AS o" in result.sql
+    assert "thelook_ecommerce" in result.sql
+
+
+def test_cte_names_are_not_qualified():
+    sql = """
+        WITH recent AS (SELECT order_id FROM orders)
+        SELECT COUNT(*) AS n FROM recent
+    """
+    result = guard(sql, UNRESTRICTED)
+    # The CTE reference must stay bare; only the real table gets qualified.
+    assert "thelook_ecommerce.recent" not in result.sql
+    assert "thelook_ecommerce" in result.sql
+
+
 def test_scope_is_injected_for_restricted_user():
     result = guard("SELECT COUNT(*) AS n FROM products", WOMENS)
     assert result.rewritten is True

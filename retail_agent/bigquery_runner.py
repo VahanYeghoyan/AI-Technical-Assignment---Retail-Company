@@ -62,6 +62,7 @@ class QueryErrorKind(StrEnum):
 
     GUARD = "guard"              # blocked by policy; tell the model why
     SYNTAX = "syntax"            # model's fault; hand back for self-correction
+    CONFIG = "config"            # OUR bug (bad job config); never self-correct
     COST = "cost_exceeded"       # ask the user to narrow the question
     PERMISSION = "permission"    # config problem; do not retry, surface to operator
     NOT_FOUND = "not_found"      # table/dataset missing
@@ -148,6 +149,16 @@ def _classify(err: Exception) -> QueryError:
     lowered = message.lower()
 
     if isinstance(err, gexc.BadRequest):
+        # Not every 400 is the model's fault. A malformed job configuration is
+        # OUR bug, and handing it to the model as "fix your SQL" burns the whole
+        # repair budget on something no SQL change can resolve. Check this first.
+        if "job.configuration" in message or "Invalid value at" in message:
+            return QueryError(
+                QueryErrorKind.CONFIG,
+                message,
+                hint="The query was not the problem; the job configuration was "
+                "rejected. This needs an operator, not a rewrite.",
+            )
         # BigQuery reports genuine SQL mistakes as 400s. Distinguishing a syntax
         # error from other 400s is what makes self-correction converge.
         if any(
@@ -363,14 +374,21 @@ class BigQueryRunner:
     def _job_config(self, *, dry_run: bool):
         from google.cloud import bigquery
 
-        return bigquery.QueryJobConfig(
+        config = bigquery.QueryJobConfig(
             dry_run=dry_run,
             use_query_cache=True,
-            # Second ceiling: even if the dry-run estimate is wrong, BigQuery
-            # itself refuses to bill beyond this.
-            maximum_bytes_billed=None if dry_run else self.max_bytes_billed,
             labels={"app": "retail-agent"},
         )
+        if not dry_run:
+            # Second ceiling: even if the dry-run estimate is wrong, BigQuery
+            # itself refuses to bill beyond this.
+            #
+            # Set only when it applies. Assigning None does NOT mean "unset" —
+            # the client serialises it into the request as the string "None",
+            # and BigQuery rejects the job with
+            # "Invalid value at 'maximum_bytes_billed' (TYPE_INT64)".
+            config.maximum_bytes_billed = self.max_bytes_billed
+        return config
 
     def _dry_run(self, sql: str, *, tracer: Tracer | None) -> int:
         self._breaker.check(time.monotonic())

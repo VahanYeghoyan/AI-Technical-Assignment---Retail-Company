@@ -60,8 +60,12 @@ class Scope:
         """Human-readable scope, shown at CLI login and in refusal messages."""
         if self.unrestricted:
             return "the full product catalogue"
+        # Singular forms are spelled out: trimming the trailing "s" turns
+        # "categories" into "categorie", and this string is user-facing.
+        singular = {"departments": "department", "categories": "category",
+                    "brands": "brand"}
         parts = [
-            f"{dim[:-1]} in {sorted(getattr(self, dim))}"
+            f"{singular[dim]} in {sorted(getattr(self, dim))}"
             for dim in SCOPE_DIMENSIONS
             if getattr(self, dim)
         ]

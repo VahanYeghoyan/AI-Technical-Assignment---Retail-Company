@@ -281,6 +281,29 @@ def _check_pii(tree: exp.Expression, tables: frozenset[str]) -> None:
         )
 
 
+def _qualify_tables(tree: exp.Expression, cte_names: frozenset[str]) -> None:
+    """Expand bare table names to fully-qualified ones, in place.
+
+    The model routinely writes `FROM orders`, which BigQuery rejects with
+    "Table must be qualified with a dataset". For a scoped user the rewrite
+    below happens to fix that as a side effect, since the injected subqueries
+    are fully qualified — which meant unrestricted users were MORE likely to hit
+    the error than restricted ones. Qualifying here removes that asymmetry and
+    saves a self-correction round trip for everyone.
+    """
+    for table in tree.find_all(exp.Table):
+        name = table.name.lower()
+        if name in cte_names or name not in ALLOWED_TABLES:
+            continue
+        if table.db:
+            continue  # already qualified
+        alias = table.args.get("alias")
+        qualified = exp.to_table(f"{PROJECT}.{DATASET}.{name}", dialect=DIALECT)
+        if alias is not None:
+            qualified.set("alias", alias)
+        table.replace(qualified)
+
+
 def _rewrite_for_scope(
     tree: exp.Expression, scope: Scope, cte_names: frozenset[str]
 ) -> bool:
@@ -317,6 +340,7 @@ def validate_and_rewrite(sql: str, scope: Scope) -> GuardResult:
     cte_names = _cte_names(tree)
     tables = _check_tables(tree, cte_names)
     _check_pii(tree, tables)
+    _qualify_tables(tree, cte_names)
     rewritten = _rewrite_for_scope(tree, scope, cte_names)
     return GuardResult(
         sql=tree.sql(dialect=DIALECT, pretty=True),
