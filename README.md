@@ -336,7 +336,9 @@ tested only against lookalikes tends to be wrong against the real thing.
 ```
 retail_agent/
   agent.py            orchestration loop, tools, self-correction
-  cli.py              REPL; confirmation intercepted before the model
+  cli.py              REPL renderer (Rich)
+  dispatch.py         message routing shared by every front end:
+                      confirmation first, then slash commands, then the model
   llm.py              Gemini provider, fallback, budgets, offline stub
   bigquery_runner.py  cost gate, retries, circuit breaker, classification
   reports.py          saved reports: ownership, soft delete, search

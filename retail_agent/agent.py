@@ -166,6 +166,12 @@ class Agent:
 
     history: list[dict[str, Any]] = field(default_factory=list)
 
+    # Report ids removed by the most recent confirmed deletion, so /undo can
+    # restore exactly that batch. It lives on the agent rather than on a
+    # frontend because every frontend offers /undo, and an attribute invented by
+    # whichever one happened to run first is not a contract.
+    last_deleted: tuple[str, ...] = ()
+
     # -- public -----------------------------------------------------------
 
     def ask(self, question: str) -> TurnResult:
