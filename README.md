@@ -23,9 +23,10 @@ implements in design only.
 | Quality assurance | Design only |
 | Agility (persona) | Implemented (hot-reload) + design |
 
-**121 tests pass with no credentials and no LLM quota.** That is deliberate: the
-safety and oversight guarantees are the ones that must be verifiable in CI on any
-machine, without reaching a third party.
+**129 tests pass with no credentials and no LLM quota** — 121 of them without the
+optional web UI installed, whose tests skip when streamlit is absent. That is
+deliberate: the safety and oversight guarantees are the ones that must be
+verifiable in CI on any machine, without reaching a third party.
 
 Separately, the full path has been verified live against Vertex AI Gemini 3.6
 Flash and BigQuery — including entitlement rewriting on the real warehouse
@@ -89,6 +90,33 @@ stub below exists.
 python -m retail_agent.cli --user maya
 python -m retail_agent.cli --list-users    # see the available personas
 ```
+
+### 5. Optional: the web UI
+
+The same agent in a browser, for anyone who would rather not read a terminal.
+Streamlit is deliberately **not** in `requirements.txt` — the CLI is the
+interface this prototype is built around and installing it should not pull in a
+web stack:
+
+```bash
+pip install -r requirements-ui.txt
+streamlit run streamlit_app.py
+```
+
+It is a second *renderer*, not a second agent. Both front ends call
+`retail_agent/dispatch.py`, which decides what a message means — a live deletion
+confirmation, a slash command, or a question for the model — so the confirmation
+state machine, the model-bypassing slash commands and the entitlement scoping
+behave identically in both. The sidebar switches executive persona, shows the
+live data scope and persona version, and starts a new conversation.
+
+Deliberately, there are no Confirm / Cancel buttons: above three reports the
+oversight flow requires the user to type the count (`delete 7`), and a button
+would turn that back into the reflexive single click the rule exists to prevent.
+
+Every answer carries the same turn telemetry the traces record — status, model
+calls, SQL attempts, self-corrections, tokens, bytes billed and the trace id —
+plus the scope-rewritten SQL that actually reached BigQuery.
 
 ### Running with no credentials at all
 
@@ -172,7 +200,7 @@ JOIN ( ... same treatment for products ... ) AS p
 GROUP BY p.brand
 ```
 
-### CLI commands
+### Commands (identical in the CLI and the web UI)
 
 | Command | Does |
 |---|---|
@@ -320,8 +348,9 @@ hand-rolled or design-only here.
 ## Testing
 
 ```bash
-pytest                      # 111 tests, no credentials required
+pytest                      # 129 tests, no credentials required
 pytest tests/test_safety.py -v
+pytest tests/test_streamlit_ui.py -v    # skipped unless the web UI is installed
 ```
 
 External services are faked, but where the real service raises a specific
@@ -354,6 +383,7 @@ config/
   entitlements.yaml   who may analyse which products
   persona.yaml        tone — editable by non-developers, hot-reloaded
   metrics.yaml        metric definitions (revenue, churn, underspending…)
+streamlit_app.py      optional web UI; renders what dispatch.py reports
 ```
 
 ---

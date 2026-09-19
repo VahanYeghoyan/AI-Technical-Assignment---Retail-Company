@@ -21,3 +21,7 @@ PyYAML>=6.0
 
 pytest>=8.3
 pytest-asyncio>=0.24
+
+# The optional web UI is NOT installed by this file — the CLI is the required
+# interface and should not pull in a web stack. To run it as well:
+#   pip install -r requirements-ui.txt && streamlit run streamlit_app.py
