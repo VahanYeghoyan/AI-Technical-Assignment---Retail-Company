@@ -14,7 +14,10 @@ Enforced here, in order:
   4. No PII columns anywhere        — projection, WHERE, JOIN, ORDER BY alike,
                                       so membership oracles are blocked too
   5. No SELECT * touching users     — a star would expand to PII columns
-  6. Entitlement rewriting          — each table reference is replaced by a
+  6. No whole-row references        — `TO_JSON_STRING(u)` and friends smuggle
+                                      every column of a row out as one value,
+                                      including the PII ones step 4 blocks
+  7. Entitlement rewriting          — each table reference is replaced by a
                                       subquery filtered to the caller's scope
 
 Step 6 is what makes Requirement 2's "only data on products related to him"
@@ -201,6 +204,25 @@ def _cte_names(tree: exp.Expression) -> frozenset[str]:
     return frozenset(cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE))
 
 
+def _is_cte_reference(table: exp.Table, cte_names: frozenset[str]) -> bool:
+    """True only for a BARE name that a WITH clause in this query defines.
+
+    The qualification test is the security-critical half. Matching on the name
+    alone let a query name a CTE after any table it wanted to reach and then
+    address the real thing by its full path — the CTE was never used, it existed
+    purely to buy the skip:
+
+        WITH events AS (SELECT 1 FROM orders)
+        SELECT ip_address FROM `bigquery-public-data.thelook_ecommerce.events`
+
+    That escaped the allowlist AND the entitlement rewrite, because both looked
+    up `cte_names` by name. BigQuery resolves a bare name against the WITH
+    clause and a qualified one against the warehouse, so a reference carrying a
+    project or dataset is never a CTE and must be validated as a real table.
+    """
+    return not table.db and not table.catalog and table.name.lower() in cte_names
+
+
 def _check_tables(tree: exp.Expression, cte_names: frozenset[str]) -> frozenset[str]:
     """Validate every table reference and return the set of real tables used."""
     for name in sorted(cte_names):
@@ -216,7 +238,7 @@ def _check_tables(tree: exp.Expression, cte_names: frozenset[str]) -> frozenset[
     seen: set[str] = set()
     for table in tree.find_all(exp.Table):
         name = table.name.lower()
-        if name in cte_names:
+        if _is_cte_reference(table, cte_names):
             continue
         if name not in ALLOWED_TABLES:
             raise SqlGuardError(
@@ -281,6 +303,67 @@ def _check_pii(tree: exp.Expression, tables: frozenset[str]) -> None:
         )
 
 
+def _direct_sources(select: exp.Select) -> list[exp.Expression]:
+    """The FROM and JOIN targets of THIS select — not of its subqueries.
+
+    Found by scanning for From/Join nodes rather than by argument name, because
+    sqlglot keys the FROM clause as "from_" in 30.x and as "from" in earlier
+    releases. Reading the wrong key returns None and the caller's check then
+    passes everything, in silence — a way for a safety rule to stop working
+    that no test of valid queries would ever notice.
+    """
+    sources: list[exp.Expression] = []
+    for value in select.args.values():
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, (exp.From, exp.Join)):
+                sources.append(item.this)
+    return sources
+
+
+def _check_row_references(tree: exp.Expression, cte_names: frozenset[str]) -> None:
+    """Reject a bare reference to a table alias, i.e. the row as a single value.
+
+    In BigQuery an alias used on its own is the whole row, so every one of these
+    returns the PII columns that _check_pii refuses to let anyone name:
+
+        SELECT TO_JSON_STRING(u) FROM users u        -- every column, as JSON
+        SELECT u FROM users u                        -- every column, as a STRUCT
+        SELECT JSON_VALUE(TO_JSON_STRING(u), '$.first_name') FROM users u
+        SELECT COUNT(*) FROM users u                 -- and the oracle again:
+         WHERE STRPOS(TO_JSON_STRING(u), 'alice@example.com') > 0
+
+    None of them names a forbidden column, so a column-name check cannot see
+    them, and the result-set scrubber cannot either: it matches emails and
+    addresses, not names or postcodes, and a STRUCT column is not even a string.
+
+    Only BASE tables are checked, and only within the SELECT that has them in
+    its FROM. A reference to a CTE is safe because the CTE's own projection was
+    already validated by every rule here, and scoping the check to one SELECT
+    keeps a column that happens to share a name with a table elsewhere in the
+    query (`SELECT COUNT(*) AS orders ...`) from being mistaken for a row.
+    """
+    for select in tree.find_all(exp.Select):
+        sources = _direct_sources(select)
+        aliases = {
+            (table.alias or table.name).lower()
+            for table in sources
+            if isinstance(table, exp.Table) and not _is_cte_reference(table, cte_names)
+        }
+        if not aliases:
+            continue
+
+        for column in select.find_all(exp.Column):
+            if column.table:
+                continue  # alias.column — a named column, which step 4 checks
+            if column.name.lower() in aliases:
+                raise SqlGuardError(
+                    "row_reference",
+                    f"{column.name!r} refers to a whole row, which would expose "
+                    "every column including the personal ones. Select the "
+                    "columns you need by name instead.",
+                )
+
+
 def _qualify_tables(tree: exp.Expression, cte_names: frozenset[str]) -> None:
     """Expand bare table names to fully-qualified ones, in place.
 
@@ -293,12 +376,23 @@ def _qualify_tables(tree: exp.Expression, cte_names: frozenset[str]) -> None:
     """
     for table in tree.find_all(exp.Table):
         name = table.name.lower()
-        if name in cte_names or name not in ALLOWED_TABLES:
+        if _is_cte_reference(table, cte_names) or name not in ALLOWED_TABLES:
             continue
-        if table.db:
-            continue  # already qualified
+        if table.db and table.catalog:
+            continue  # already fully qualified
+        # A two-part name like `thelook_ecommerce.orders` is NOT qualified: with
+        # no project, BigQuery resolves the dataset inside the *billing* project,
+        # where it does not exist. Unrestricted users got a 404 while scoped ones
+        # worked, because only their rewrite supplied the project.
         alias = table.args.get("alias")
-        qualified = exp.to_table(f"{PROJECT}.{DATASET}.{name}", dialect=DIALECT)
+        # Quoted identifiers, because the project id contains hyphens: rendered
+        # bare, `bigquery-public-data` is three subtractions and BigQuery fails
+        # the query. to_table() does not quote them for us.
+        qualified = exp.Table(
+            this=exp.to_identifier(name, quoted=True),
+            db=exp.to_identifier(DATASET, quoted=True),
+            catalog=exp.to_identifier(PROJECT, quoted=True),
+        )
         if alias is not None:
             qualified.set("alias", alias)
         table.replace(qualified)
@@ -314,7 +408,7 @@ def _rewrite_for_scope(
     # Materialise the node list first: the replacements themselves contain table
     # references, and re-visiting those would recurse forever.
     original_tables = [
-        t for t in tree.find_all(exp.Table) if t.name.lower() not in cte_names
+        t for t in tree.find_all(exp.Table) if not _is_cte_reference(t, cte_names)
     ]
     if not original_tables:
         return False
@@ -340,6 +434,7 @@ def validate_and_rewrite(sql: str, scope: Scope) -> GuardResult:
     cte_names = _cte_names(tree)
     tables = _check_tables(tree, cte_names)
     _check_pii(tree, tables)
+    _check_row_references(tree, cte_names)
     _qualify_tables(tree, cte_names)
     rewritten = _rewrite_for_scope(tree, scope, cte_names)
     return GuardResult(

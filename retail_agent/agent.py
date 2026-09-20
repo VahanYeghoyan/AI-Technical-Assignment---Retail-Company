@@ -20,9 +20,10 @@ call budget bounds the turn.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from retail_agent import catalog
 from retail_agent.bigquery_runner import BigQueryRunner, QueryError, QueryErrorKind
@@ -120,14 +121,23 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "name": "propose_delete_reports",
         "description": (
             "Prepare a deletion of saved reports for the user to confirm. This "
-            "does NOT delete anything. Use 'text' to match report contents, or "
-            "this_conversation=true for reports made in this conversation."
+            "does NOT delete anything. You MUST pass exactly one selector: "
+            "'text' to match report contents, this_conversation=true for reports "
+            "made in this conversation, or all_reports=true ONLY when the user "
+            "explicitly asked to delete everything."
         ),
         "parameters_json_schema": {
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "Match reports mentioning this."},
                 "this_conversation": {"type": "boolean"},
+                "all_reports": {
+                    "type": "boolean",
+                    "description": (
+                        "Every saved report the user owns. Only when they asked "
+                        "for all of them, never as a default."
+                    ),
+                },
                 "criteria": {
                     "type": "string",
                     "description": "Human description, e.g. \"mentioning Acme\".",
@@ -240,10 +250,22 @@ class Agent:
 
     def _run_loop(self) -> TurnResult:
         system = build_system_prompt(self.scope, preferences=self.preferences)
+        # The assembled prompt, once per turn: "what was this model actually
+        # told?" is the first question any debugging session asks, and it was
+        # the one thing the trace could not answer. The digest identifies the
+        # exact prompt across turns even when the body is truncated in the
+        # trace, so "did this user get the new persona?" is answerable without
+        # TRACE_FULL_MESSAGES=1.
+        self.tracer.emit(
+            "prompt.built",
+            system=system,
+            system_sha=hashlib.sha256(system.encode()).hexdigest()[:12],
+            system_chars=len(system),
+            history_entries=len(self.history),
+        )
         corrections = 0
         saved: list[str] = []
         executed: list[str] = []
-        pending: PendingDeletion | None = None
 
         while True:
             with self.tracer.span("llm.generate"):
@@ -258,88 +280,99 @@ class Agent:
                 return TurnResult(
                     answer=response.text or "I do not have an answer for that.",
                     trace_id=self.tracer.trace_id,
-                    pending_deletion=pending,
                     saved_report_ids=tuple(saved),
                     sql_executed=tuple(executed),
                 )
 
+            # One model turn carrying every call of this step, in the order they
+            # were returned. Splitting them into a turn each cost the second call
+            # its thought_signature — Gemini only signs the first — and the next
+            # request died on "400 Function call is missing a thought_signature",
+            # after the queries had already run and been billed.
+            self._append_function_calls(response.function_calls)
+
+            results: list[tuple[str, dict[str, Any]]] = []
+            pending: PendingDeletion | None = None
+            stop: TurnResult | None = None
+
             for call in response.function_calls:
                 self.tracer.metrics.tool_calls += 1
                 self.tracer.emit("tool.call", name=call.name, args=call.args)
-                self._append_function_call(call)
 
-                if call.name == "run_analysis_sql":
-                    outcome, ok = self._tool_run_sql(call.args)
-                    if ok:
-                        executed.append(outcome["sql"])
-                    elif outcome.get("self_correctable"):
-                        corrections += 1
-                        self.tracer.metrics.sql_self_corrections += 1
-                        if corrections > MAX_SQL_CORRECTIONS:
-                            return self._give_up_on_sql(outcome, executed, saved)
-                    self._append_function_result(call.name, outcome)
+                # An unexpected failure inside a tool must still answer the
+                # call it belongs to. Returning early without a response
+                # leaves a malformed history behind that every later turn in
+                # this conversation has to carry.
+                answered = len(results)
+                try:
+                    if call.name == "run_analysis_sql":
+                        outcome, ok = self._tool_run_sql(call.args)
+                        results.append((call.name, outcome))
+                        if ok:
+                            executed.append(outcome["sql"])
+                        elif outcome.get("retriable_by_model"):
+                            corrections += 1
+                            self.tracer.metrics.sql_self_corrections += 1
+                            if corrections > MAX_SQL_CORRECTIONS and stop is None:
+                                stop = self._give_up_on_sql(outcome, executed, saved)
+                        elif stop is None:
+                            # Nothing the model can write will fix a warehouse that
+                            # is down, unreachable or refusing our credentials.
+                            stop = self._warehouse_unavailable(outcome, executed, saved)
 
-                elif call.name == "describe_schema":
-                    self._append_function_result(
-                        call.name,
-                        {"schema": catalog.describe_schema(call.args.get("table"))},
-                    )
+                    elif call.name == "describe_schema":
+                        results.append(
+                            (call.name,
+                             {"schema": catalog.describe_schema(call.args.get("table"))})
+                        )
 
-                elif call.name == "save_report":
-                    report = self.store.save(
-                        owner=self.scope.user_id,
-                        conversation_id=self.conversation_id,
-                        title=str(call.args.get("title", "Untitled report")),
-                        body=str(call.args.get("body", "")),
-                        entities=[str(e) for e in call.args.get("entities", [])],
-                    )
-                    saved.append(report.report_id)
-                    self.tracer.audit("report_saved", report_id=report.report_id)
-                    self._append_function_result(
-                        call.name,
-                        {"saved": True, "report_id": report.report_id[:8],
-                         "title": report.title},
-                    )
+                    elif call.name == "save_report":
+                        results.append((call.name, self._tool_save_report(call.args, saved)))
 
-                elif call.name == "list_reports":
-                    reports = self.store.search(
-                        actor=self.scope.user_id, text=call.args.get("text")
-                    )
-                    self._append_function_result(
-                        call.name, {"reports": [r.summary() for r in reports]}
-                    )
+                    elif call.name == "list_reports":
+                        reports = self.store.search(
+                            actor=self.scope.user_id, text=call.args.get("text")
+                        )
+                        results.append(
+                            (call.name, {"reports": [r.summary() for r in reports]})
+                        )
 
-                elif call.name == "propose_delete_reports":
-                    pending = self.broker.propose_deletion(
-                        actor=self.scope.user_id,
-                        criteria=str(call.args.get("criteria", "the reports you named")),
-                        text=call.args.get("text"),
-                        conversation_id=(
-                            self.conversation_id
-                            if call.args.get("this_conversation")
-                            else None
-                        ),
+                    elif call.name == "propose_delete_reports":
+                        pending, outcome = self._tool_propose_deletion(call.args)
+                        results.append((call.name, outcome))
+
+                    else:
+                        results.append(
+                            (call.name, {"error": f"unknown tool {call.name!r}"})
+                        )
+                except Exception as err:  # noqa: BLE001
+                    self.tracer.emit(
+                        "tool.error", name=call.name,
+                        error_type=type(err).__name__, error=str(err),
                     )
-                    self.tracer.audit(
-                        "deletion_proposed",
-                        count=len(pending.targets),
-                        criteria=pending.criteria,
-                    )
-                    # Returning early: the confirmation prompt IS the turn's
-                    # answer, and the model must not narrate over it.
-                    return TurnResult(
-                        answer=pending.prompt(),
-                        trace_id=self.tracer.trace_id,
-                        pending_deletion=pending if pending.targets else None,
-                        saved_report_ids=tuple(saved),
-                        sql_executed=tuple(executed),
-                        status="awaiting_confirmation" if pending.targets else "ok",
+                    del results[answered:]
+                    results.append(
+                        (call.name, {"error": f"{type(err).__name__}: {err}"})
                     )
 
-                else:
-                    self._append_function_result(
-                        call.name, {"error": f"unknown tool {call.name!r}"}
-                    )
+            # Every call answered, in one user turn, before anything returns.
+            # A call left without its response is a malformed history that the
+            # next turn has to carry.
+            self._append_function_results(results)
+
+            if pending is not None:
+                # The confirmation prompt IS the turn's answer; the model must
+                # not narrate over it.
+                return TurnResult(
+                    answer=pending.prompt(),
+                    trace_id=self.tracer.trace_id,
+                    pending_deletion=pending if pending.targets else None,
+                    saved_report_ids=tuple(saved),
+                    sql_executed=tuple(executed),
+                    status="awaiting_confirmation" if pending.targets else "ok",
+                )
+            if stop is not None:
+                return stop
 
     # -- tools ------------------------------------------------------------
 
@@ -350,14 +383,16 @@ class Agent:
                 result = self.runner.execute(sql, self.scope, tracer=self.tracer)
         except QueryError as err:
             self.tracer.emit("sql.failed", kind=str(err.kind), error=err.message)
-            payload = {
-                "error": err.message,
-                "hint": err.hint or "",
-                "self_correctable": err.self_correctable,
-            }
-            if err.kind is QueryErrorKind.COST:
-                payload["hint"] = err.hint
-            return payload, False
+            return (
+                {
+                    "error": err.message,
+                    "hint": err.hint or "",
+                    "kind": str(err.kind),
+                    "self_correctable": err.self_correctable,
+                    "retriable_by_model": err.retriable_by_model,
+                },
+                False,
+            )
 
         return (
             {
@@ -373,6 +408,64 @@ class Agent:
             },
             True,
         )
+
+    def _tool_save_report(
+        self, args: dict[str, Any], saved: list[str]
+    ) -> dict[str, Any]:
+        """Save a report, scrubbing it first.
+
+        The final answer is scrubbed on the way to the screen, but a report is
+        written straight to storage and read back days later — so without this
+        the library was the one place a leaked email could settle permanently.
+        """
+        title, title_hits = scrub_text(str(args.get("title", "Untitled report")))
+        body, body_hits = scrub_text(str(args.get("body", "")))
+        raw_entities = args.get("entities") or []
+        if isinstance(raw_entities, str):  # the model sometimes sends one string
+            raw_entities = [raw_entities]
+        entities = [scrub_text(str(e))[0] for e in raw_entities]
+
+        if title_hits or body_hits:
+            self.tracer.metrics.pii_redactions += len(title_hits) + len(body_hits)
+            self.tracer.audit(
+                "pii_redacted", where="saved_report", details=title_hits + body_hits
+            )
+
+        report = self.store.save(
+            owner=self.scope.user_id,
+            conversation_id=self.conversation_id,
+            title=title,
+            body=body,
+            entities=entities,
+        )
+        saved.append(report.report_id)
+        self.tracer.audit("report_saved", report_id=report.report_id)
+        return {"saved": True, "report_id": report.report_id[:8], "title": report.title}
+
+    def _tool_propose_deletion(
+        self, args: dict[str, Any]
+    ) -> tuple[PendingDeletion, dict[str, Any]]:
+        pending = self.broker.propose_deletion(
+            actor=self.scope.user_id,
+            criteria=str(args.get("criteria", "the reports you named")),
+            text=args.get("text"),
+            conversation_id=(
+                self.conversation_id if args.get("this_conversation") else None
+            ),
+            all_reports=bool(args.get("all_reports")),
+        )
+        self.tracer.audit(
+            "deletion_proposed",
+            count=len(pending.targets),
+            criteria=pending.criteria,
+            selector=pending.selector,
+        )
+        return pending, {
+            "status": "awaiting_user_confirmation",
+            "matched": len(pending.targets),
+            "criteria": pending.criteria,
+            "note": "Nothing is deleted yet. The user confirms or cancels next.",
+        }
 
     def _give_up_on_sql(
         self, outcome: dict[str, Any], executed: list[str], saved: list[str]
@@ -390,6 +483,49 @@ class Agent:
             sql_executed=tuple(executed),
             saved_report_ids=tuple(saved),
             status="sql_unrecoverable",
+        )
+
+    def _warehouse_unavailable(
+        self, outcome: dict[str, Any], executed: list[str], saved: list[str]
+    ) -> TurnResult:
+        """End the turn on a failure no rewrite can fix, and name it honestly.
+
+        These used to go back to the model as just another failed tool call. It
+        would rewrite the query, the rewrite would fail the same way, and the
+        turn ended on the call budget telling the user to "narrow the question"
+        — for an expired credential or a network outage. Eight model calls and
+        eight BigQuery attempts to produce advice that could not possibly help.
+        """
+        kind = outcome.get("kind", "")
+        self.tracer.emit("sql.unavailable", kind=kind)
+        if kind == str(QueryErrorKind.PERMISSION):
+            message = (
+                "I cannot reach the data warehouse — this deployment's "
+                "credentials were refused. That needs an operator, not a "
+                "different question. Your saved reports are unaffected."
+            )
+            status = "warehouse_permission"
+        elif kind in {str(QueryErrorKind.TRANSIENT), str(QueryErrorKind.TIMEOUT),
+                      str(QueryErrorKind.CIRCUIT_OPEN)}:
+            message = (
+                "The data warehouse is not responding at the moment, so I "
+                "cannot run the analysis. I have stopped retrying rather than "
+                "queue up queries against it — please try again shortly."
+            )
+            status = "warehouse_unavailable"
+        else:
+            message = (
+                "Something went wrong between me and the data warehouse that I "
+                "cannot work around. Quote trace "
+                f"{self.tracer.trace_id} to an operator."
+            )
+            status = "warehouse_error"
+        return TurnResult(
+            answer=message,
+            trace_id=self.tracer.trace_id,
+            sql_executed=tuple(executed),
+            saved_report_ids=tuple(saved),
+            status=status,
         )
 
     # -- helpers ----------------------------------------------------------
@@ -420,30 +556,38 @@ class Agent:
         self.history.append({"role": role, "parts": [{"text": text}]})
         self._trim()
 
-    def _append_function_call(self, call: FunctionCall) -> None:
-        part: dict[str, Any] = {
-            "function_call": {"name": call.name, "args": call.args}
-        }
-        if call.thought_signature is not None:
-            # Gemini 3.x rejects history whose functionCall parts have lost their
-            # thought_signature, so it is echoed back exactly as received.
-            part["thought_signature"] = call.thought_signature
-        self.history.append({"role": "model", "parts": [part]})
+    def _append_function_calls(self, function_calls: Sequence[FunctionCall]) -> None:
+        """Echo one model step back as one model turn, parts in order.
 
-    def _append_function_result(self, name: str, payload: dict[str, Any]) -> None:
-        self.history.append(
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "function_response": {
-                            "name": name,
-                            "response": json.loads(json.dumps(payload, default=str)),
-                        }
-                    }
-                ],
+        Gemini returns parallel calls as several parts of a SINGLE content and
+        signs only the first of them. Appending a turn per call therefore
+        produced a second turn whose call had no thought_signature, which the
+        API rejects outright.
+        """
+        parts: list[dict[str, Any]] = []
+        for call in function_calls:
+            part: dict[str, Any] = {
+                "function_call": {"name": call.name, "args": call.args}
             }
-        )
+            if call.thought_signature is not None:
+                # Gemini 3.x rejects history whose functionCall parts have lost
+                # their thought_signature, so it is echoed back as received.
+                part["thought_signature"] = call.thought_signature
+            parts.append(part)
+        self.history.append({"role": "model", "parts": parts})
+
+    def _append_function_results(
+        self, results: Sequence[tuple[str, dict[str, Any]]]
+    ) -> None:
+        """One response part per call, in the same order, in one user turn."""
+        parts: list[dict[str, Any]] = []
+        for name, payload in results:
+            clean = json.loads(json.dumps(payload, default=str))
+            parts.append({"function_response": {"name": name, "response": clean}})
+            # What the model was actually handed back — the other half of the
+            # correspondence a trace has to be able to replay.
+            self.tracer.emit("tool.result", name=name, response=clean)
+        self.history.append({"role": "user", "parts": parts})
         self._trim()
 
     def _trim(self) -> None:

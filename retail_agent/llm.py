@@ -136,14 +136,29 @@ def _classify_genai(err: Exception) -> LLMError:
     if code == 429 or "resource_exhausted" in lowered or "rate limit" in lowered:
         # Distinguish "slow down" from "you are out of money". Only the first is
         # worth retrying, and confusing them produces a loop that never succeeds.
+        #
+        # A retry hint decides it. AI Studio's free tier answers a per-MINUTE
+        # limit with a 429 that mentions both "billing" and "Quota exceeded" and
+        # ends "Please retry in 18.5s" — so matching those words alone declared
+        # the account empty and told the user retrying would not help, when the
+        # only thing wrong was asking two questions in quick succession. That is
+        # the exact limit this assignment warns about living within.
         if any(
             token in lowered
-            for token in ("credits are depleted", "quota exceeded", "billing",
-                          "exhausted your current quota", "insufficient")
+            for token in ("please retry in", "retry_delay", "retrydelay",
+                          "retry after", "retry-after", "per minute", "per-minute",
+                          "rate limit", "requests per")
+        ):
+            return LLMTransientError(message)
+        if any(
+            token in lowered
+            for token in ("credits are depleted", "prepayment", "quota exceeded",
+                          "billing", "exhausted your current quota", "insufficient")
         ):
             return LLMQuotaError(
-                f"{message}\nThe API key has no remaining quota — retrying will not "
-                "help. Top up credits in AI Studio or use a key with free-tier quota."
+                f"{message}\nThis deployment has no remaining model quota — retrying "
+                "will not help. Top up credits for the API key, or switch to "
+                "LLM_PROVIDER=vertex, which bills through the GCP project."
             )
         return LLMTransientError(message)
 
@@ -276,6 +291,15 @@ class GeminiProvider:
                 # than failing the turn. Note this does NOT catch plain
                 # LLMConfigError — a malformed request or a bad key fails the
                 # same way on every model, so falling back would only pay twice.
+                last = err
+                continue
+            except LLMTransientError as err:
+                # Retries against this model are spent. A rate limit or an
+                # overload is usually per model, so the smaller one is often
+                # still serving — which is what the fallback is for. (It was
+                # documented as working this way but only ever triggered on a
+                # 404, so every rate-limited turn failed with a spare model
+                # sitting idle.)
                 last = err
                 continue
             except LLMQuotaError:

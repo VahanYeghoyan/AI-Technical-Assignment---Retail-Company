@@ -14,16 +14,16 @@ implements in design only.
 
 | Requirement | State |
 |---|---|
-| Safety & PII masking | Implemented, 39 tests |
-| High-stakes oversight (destructive ops) | Implemented, 27 tests |
-| Resilience & error handling | Implemented, 24 tests |
+| Safety & PII masking | Implemented, 63 tests |
+| High-stakes oversight (destructive ops) | Implemented, 31 tests |
+| Resilience & error handling | Implemented, 31 tests |
 | Observability | Implemented, replayable traces |
 | Hybrid intelligence (Golden Bucket) | Design only — [architecture](docs/architecture.md#1-hybrid-intelligence) |
 | Learning loop | Design only |
 | Quality assurance | Design only |
 | Agility (persona) | Implemented (hot-reload) + design |
 
-**129 tests pass with no credentials and no LLM quota** — 121 of them without the
+**181 tests pass with no credentials and no LLM quota** — 173 of them without the
 optional web UI installed, whose tests skip when streamlit is absent. That is
 deliberate: the safety and oversight guarantees are the ones that must be
 verifiable in CI on any machine, without reaching a third party.
@@ -233,17 +233,42 @@ Every model-written query is parsed with **sqlglot** and must survive:
    named person exists. PII columns are rejected in `WHERE`, `JOIN` and
    `ORDER BY` too;
 5. no `SELECT *` over `users`, since a star expands into PII columns. `COUNT(*)`
-   is explicitly still allowed.
+   is explicitly still allowed;
+6. **no whole-row references.** In BigQuery a table alias used on its own *is*
+   the row, so `TO_JSON_STRING(u)`, `SELECT u`, `ARRAY_AGG(u)` and
+   `JSON_VALUE(TO_JSON_STRING(u), '$.first_name')` each return every column —
+   including the ones rule 4 blocks — without naming any of them. A column-name
+   check cannot see those, and neither can the result scrubber: it matches
+   emails and addresses, not names or postcodes, and a STRUCT is not a string.
+   The oracle comes back this way too
+   (`WHERE STRPOS(TO_JSON_STRING(u), 'alice@example.com') > 0`), so the row
+   itself is rejected.
+
+A reference carrying a project or a dataset is never treated as a CTE, however
+it is named. Matching on the bare name let a query define a CTE after any table
+it wanted and then address the real one by its full path — escaping both the
+allowlist (`…thelook_ecommerce.events.ip_address`, or another project entirely)
+and the entitlement rewrite (`…order_item*`, the wildcard form of
+`order_items`, which showed a Women's-division user the whole company's
+revenue).
 
 PII columns (verified against the live schema): `first_name`, `last_name`,
 `email`, `street_address`, `postal_code`, `latitude`, `longitude`, and
 `user_geom` — a `GEOGRAPHY` column that pinpoints a home and is easy to miss.
 
-Then three more layers: result sets are scrubbed before they reach the model,
-the final answer is scrubbed before display, and trace files are scrubbed on the
-way in — a debug log should not quietly become the one place customer emails are
+Then four more layers: result sets are scrubbed before they reach the model,
+every customer id column in a result is replaced with a salted pseudonym, the
+final answer is scrubbed before display, and trace files are scrubbed on the way
+in — a debug log should not quietly become the one place customer emails are
 retained. "Top customers" works, but customers appear as salted pseudonyms
 (`CUST-A83F21`), stable within a deployment so follow-up questions still resolve.
+The pseudonym is applied in code, on the way out of BigQuery: asking the model
+to write `CUST-` ids it had never been shown only got them invented.
+
+The text scrubber matches address- and phone-*shaped* text, case included. A
+case-insensitive version matched most business writing — "focus on 3 levers to
+drive repeat purchases" redacted as an address — and an answer mutilated by its
+own safety layer is a bug every reader sees.
 
 **Per-user entitlements.** `config/entitlements.yaml` maps each executive to a
 predicate over products (department / category / brand). The guard rewrites every
@@ -268,6 +293,10 @@ Strictness scales with blast radius, so the flow stays usable:
   precisely the failure that hurts at scale, and it is the one thing this blocks.
 - Anything that is not a confirmation cancels and is handled as a normal
   question — the user is never trapped in a prompt.
+- A deletion request with **no selector is refused**, not treated as "all". The
+  model must pass the text it matched on, this conversation, or an explicit
+  `all_reports` — and an unfiltered delete is relabelled "ALL of your saved
+  reports" in the prompt, whatever the model called it.
 - Proposals expire after 5 minutes.
 - The match set is always itemised *before* confirmation.
 - Deletes are **soft**, restorable for 30 days via `/undo`, and audit-logged.
@@ -282,16 +311,20 @@ Failures are **classified**, because the right response differs and one generic
 | Failure | Response |
 |---|---|
 | SQL syntax error / guard rejection | hand the error text back to the model, bounded to 3 repair attempts |
-| Transient 5xx, rate limit | retry with exponential backoff + jitter |
-| Quota/credits exhausted | **fatal — no retry.** More requests cannot succeed |
+| Transient 5xx, rate limit | retry with exponential backoff + jitter, then the secondary model |
+| Rate limit *with* a retry hint | transient, not fatal — AI Studio's per-minute 429 says "billing" and "quota exceeded" but ends "retry in 18.5s" |
+| Quota/credits exhausted (no retry hint) | **fatal — no retry.** More requests cannot succeed |
 | Retired model (404) | fall back to the secondary model |
 | Cost over cap | reject and ask the user to narrow |
-| Permission error | fail fast, surface to the operator |
+| Permission error, lost credentials, network down | **end the turn and say so.** No rewrite fixes these, and handing them back spends the whole budget to fail again |
+| Query timeout | cancel the job, then retry — an abandoned job keeps running and billing |
 
 Cost control: every query is **dry-run first** and rejected before execution if
 it would scan more than `BQ_MAX_BYTES_BILLED`, with `maximum_bytes_billed` set
 on the real job as a second ceiling. A circuit breaker stops a BigQuery outage
-from becoming a cost incident, and a per-turn model-call budget caps any loop.
+from becoming a cost incident — it counts dry-run failures too, since the dry
+run is the first call of every query and so the first thing an outage takes
+down. A per-turn model-call budget caps any loop.
 Result sets are row-capped before entering the prompt.
 
 Empty results are reported as empty, never as zero — the model is explicitly
@@ -310,8 +343,14 @@ attempts, guard rejections, self-corrections, bytes billed, empty results, PII
 redactions, refusals, retries, fallback-model use.
 
 `/trace` lists recent turns; `/trace <id>` replays the full correspondence for
-one turn — every prompt, tool call, generated SQL, error and retry. Security
-decisions are additionally flagged `audit=true` for longer retention.
+one turn — the assembled system prompt (with a digest, so the exact prompt is
+identifiable even when the body is truncated), every tool call, the rows handed
+back to the model, the SQL it wrote *and* the scope-rewritten SQL that actually
+reached BigQuery, errors and retries. `/trace <id>` only returns the caller's
+own turns: a trace holds the question, the rows and the answer, so an unfiltered
+lookup by id would hand one executive another's analysis. Security decisions —
+deletions, restores, cancellations, entitlement rewrites, redactions — are
+flagged `audit=true` for longer retention.
 
 Tracing is best-effort: if the sink fails, the turn continues and the failure is
 counted. Observability must never be able to take down the chat.
@@ -348,7 +387,7 @@ hand-rolled or design-only here.
 ## Testing
 
 ```bash
-pytest                      # 129 tests, no credentials required
+pytest                      # 181 tests, no credentials required
 pytest tests/test_safety.py -v
 pytest tests/test_streamlit_ui.py -v    # skipped unless the web UI is installed
 ```

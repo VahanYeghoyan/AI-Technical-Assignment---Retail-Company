@@ -135,12 +135,119 @@ def test_bare_table_names_are_qualified_for_unrestricted_users():
     # Regression: BigQuery rejects `FROM orders` with "must be qualified with a
     # dataset". Scoped users were saved by the rewrite (its subqueries are
     # qualified), so the UNRESTRICTED user was the one that failed — backwards.
+    #
+    # The identifiers must come out QUOTED. This assertion used to normalise the
+    # unquoted form into the quoted one before comparing, which made it pass
+    # against SQL BigQuery rejects: bare `bigquery-public-data` is read as
+    # arithmetic on three identifiers, not as a project id.
     result = guard("SELECT COUNT(*) AS n FROM orders", UNRESTRICTED)
-    assert "`bigquery-public-data`.`thelook_ecommerce`.`orders`" in result.sql.replace(
-        "bigquery-public-data.thelook_ecommerce.orders",
-        "`bigquery-public-data`.`thelook_ecommerce`.`orders`",
-    )
+    assert "`bigquery-public-data`.`thelook_ecommerce`.`orders`" in result.sql
     assert "FROM orders" not in result.sql
+
+
+def test_two_part_names_get_the_project_added():
+    # `thelook_ecommerce.orders` has no project, so BigQuery resolves the dataset
+    # inside the BILLING project, where it does not exist — a 404 for exactly the
+    # unrestricted users the qualification above was meant to stop failing.
+    result = guard("SELECT COUNT(*) AS n FROM thelook_ecommerce.orders", UNRESTRICTED)
+    assert "`bigquery-public-data`.`thelook_ecommerce`.`orders`" in result.sql
+
+
+# ---------------------------------------------------------------------------
+# CTE names must not buy a table reference a free pass
+# ---------------------------------------------------------------------------
+
+
+def test_a_cte_name_does_not_unlock_a_qualified_table_of_the_same_name():
+    # The CTE is never used. It exists only so that the qualified reference
+    # underneath it matches a known CTE name and skips the allowlist — which is
+    # how `events.ip_address`, and any table in any project, became readable.
+    sql = """
+        WITH events AS (SELECT 1 AS x FROM orders)
+        SELECT user_id, ip_address
+        FROM `bigquery-public-data.thelook_ecommerce.events`
+    """
+    assert reason(sql) == "table_not_allowed"
+
+
+def test_a_cte_name_does_not_unlock_another_project():
+    sql = """
+        WITH secret AS (SELECT 1 AS x FROM orders)
+        SELECT * FROM `some-other-project.hr.secret`
+    """
+    assert reason(sql) == "table_not_allowed"
+
+
+def test_wildcard_table_names_are_rejected():
+    # `order_item*` is a BigQuery wildcard table that resolves to order_items
+    # itself. Quoted as a CTE name it skipped the entitlement rewrite, and a
+    # Women's-division user could read the whole company's revenue through it.
+    sql = """
+        WITH `order_item*` AS (SELECT 1 AS x FROM orders)
+        SELECT SUM(sale_price) AS rev
+        FROM `bigquery-public-data.thelook_ecommerce.order_item*`
+    """
+    assert reason(sql, WOMENS) == "table_not_allowed"
+
+
+def test_a_real_cte_reference_still_works():
+    # The bare reference is what a CTE legitimately looks like; only qualified
+    # ones are suspect.
+    result = guard(
+        "WITH monthly AS (SELECT order_id FROM orders) SELECT COUNT(*) AS n FROM monthly",
+        WOMENS,
+    )
+    assert result.rewritten is True
+
+
+# ---------------------------------------------------------------------------
+# Whole-row references (a column-name check cannot see these)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT TO_JSON_STRING(u) AS j FROM users u",
+        "SELECT u AS person FROM users u",
+        "SELECT ARRAY_AGG(u LIMIT 3) AS a FROM users u",
+        "SELECT FORMAT('%T', u) AS s FROM users u",
+        "SELECT JSON_VALUE(TO_JSON_STRING(u), '$.first_name') AS fn FROM users u",
+        # The membership oracle again, rebuilt without naming a PII column.
+        "SELECT COUNT(*) AS n FROM users u "
+        "WHERE STRPOS(TO_JSON_STRING(u), 'alice@example.com') > 0",
+        # No alias: the table's own name is the row.
+        "SELECT TO_JSON_STRING(users) AS j FROM users",
+    ],
+)
+def test_whole_row_references_are_rejected(sql):
+    assert reason(sql) == "row_reference"
+
+
+def test_row_reference_check_survives_scoping():
+    # Restricted users get the same answer as unrestricted ones: the rewrite
+    # happens after validation, so it cannot be used to sneak one past.
+    assert reason("SELECT TO_JSON_STRING(u) AS j FROM users u", WOMENS) == "row_reference"
+
+
+def test_a_column_sharing_a_table_name_is_not_a_row_reference():
+    # `orders` here is a count, not a row. The check is scoped to the SELECT that
+    # actually has the table in its FROM, so this must still be allowed.
+    sql = """
+        WITH t AS (SELECT COUNT(*) AS orders FROM orders)
+        SELECT orders FROM t
+    """
+    assert guard(sql).tables == frozenset({"orders"})
+
+
+def test_a_row_reference_to_a_cte_is_allowed():
+    # A CTE's projection has already passed every rule here, so its rows hold no
+    # column the user could not have selected directly.
+    sql = """
+        WITH t AS (SELECT id, age FROM users)
+        SELECT COUNT(*) AS n FROM t
+    """
+    assert "users" in guard(sql).tables
 
 
 def test_already_qualified_tables_are_left_alone():
@@ -321,3 +428,67 @@ def test_pseudonymize_column_renames_and_masks():
     out = pii.pseudonymize_column(df)
     assert "customer" in out.columns and "user_id" not in out.columns
     assert out["customer"].iloc[0].startswith("CUST-")
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        # Every one of these came back mutilated when the address pattern was
+        # case-insensitive and the phone pattern accepted ten bare digits:
+        # "<number> <any words> <suffix word>" describes most business writing.
+        "Q2 action items: focus on 3 levers to drive repeat purchases.",
+        "In 2025 revenue grew in every way we measure it.",
+        "We sold 279 units at the St. Louis store.",
+        "Total bytes scanned: 1005593512 for the full year.",
+        "Top 3 brands by revenue, 2026 to date, excluding 44,769 cancelled rows.",
+        "Action: review the 5 worst-performing SKUs by margin this quarter.",
+    ],
+)
+def test_scrubbing_leaves_ordinary_executive_prose_alone(prose):
+    assert pii.scrub_text(prose) == (prose, [])
+
+
+@pytest.mark.parametrize(
+    "text,marker",
+    [
+        # …while still catching the real thing, in the shapes thelook generates.
+        ("Ship to 6389 Pine Drive, apartment 4.", "[REDACTED_ADDRESS]"),
+        ("Home is 8395 Hall Points Apt. 320.", "[REDACTED_ADDRESS]"),
+        ("Mail 46177 Bell Crossing Suite 12 today.", "[REDACTED_ADDRESS]"),
+        ("Call the vendor on (312) 555-0134.", "[REDACTED_PHONE]"),
+        ("Reach ops at 312-555-0134.", "[REDACTED_PHONE]"),
+        ("Contact jane.doe@example.com now.", "[REDACTED_EMAIL]"),
+        ("Seen at 40.7128, -74.0060 last week.", "[REDACTED_LOCATION]"),
+    ],
+)
+def test_real_personal_data_is_still_redacted(text, marker):
+    assert marker in pii.scrub_text(text)[0]
+
+
+def test_struct_and_array_cells_are_scrubbed_too():
+    # A STRUCT arrives as a dict and an ARRAY as a list. Scrubbing only str cells
+    # meant anything nested inside one was passed through untouched.
+    df = pd.DataFrame(
+        {"profile": [{"note": "mail bob@example.com"}], "tags": [["a@b.com"]]}
+    )
+    cleaned, applied = pii.scrub_dataframe(df)
+    assert "bob@example.com" not in str(cleaned["profile"].iloc[0])
+    assert "a@b.com" not in str(cleaned["tags"].iloc[0])
+    assert len(applied) == 2
+
+
+def test_customer_id_columns_are_pseudonymised_in_place():
+    df = pd.DataFrame({"user_id": [1, 2], "spend": [10.0, 20.0]})
+    out, columns = pii.pseudonymize_customer_ids(df)
+
+    assert columns == ["user_id"]
+    assert out["user_id"].tolist() == [pii.pseudonymize(1), pii.pseudonymize(2)]
+    # The column keeps its name, so two id columns in one result cannot collide.
+    assert list(out.columns) == ["user_id", "spend"]
+
+
+def test_pseudonymisation_leaves_other_id_columns_alone():
+    # Only the query knows which integer is a customer; `id` here is a product.
+    df = pd.DataFrame({"id": [7], "brand": ["Levi's"]})
+    out, columns = pii.pseudonymize_customer_ids(df)
+    assert columns == [] and out["id"].iloc[0] == 7

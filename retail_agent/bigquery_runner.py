@@ -42,7 +42,7 @@ import pandas as pd
 from google.api_core import exceptions as gexc
 
 from retail_agent.observability import Tracer
-from retail_agent.safety.pii import scrub_dataframe
+from retail_agent.safety.pii import pseudonymize_customer_ids, scrub_dataframe
 from retail_agent.safety.scope import Scope
 from retail_agent.safety.sql_guard import SqlGuardError, validate_and_rewrite
 
@@ -90,6 +90,23 @@ class QueryError(Exception):
     def self_correctable(self) -> bool:
         return self.kind in {QueryErrorKind.SYNTAX, QueryErrorKind.GUARD}
 
+    @property
+    def retriable_by_model(self) -> bool:
+        """Could a DIFFERENT query plausibly succeed?
+
+        Wider than self_correctable: a cost rejection is not a mistake in the
+        SQL, but narrowing the question does fix it, and a missing table means
+        the model named something that is not there. Everything outside this set
+        is infrastructure — credentials, outages, our own job config — where
+        handing the model another turn only spends the budget to fail again.
+        """
+        return self.kind in {
+            QueryErrorKind.SYNTAX,
+            QueryErrorKind.GUARD,
+            QueryErrorKind.COST,
+            QueryErrorKind.NOT_FOUND,
+        }
+
 
 @dataclass
 class QueryResult:
@@ -105,8 +122,15 @@ class QueryResult:
     def is_empty(self) -> bool:
         return self.row_count == 0
 
-    def to_markdown(self, max_rows: int = 20) -> str:
+    def to_markdown(self, max_rows: int | None = None) -> str:
         """Compact rendering for the model's context and the CLI.
+
+        Renders every row the runner kept. It used to default to 20 while the
+        runner's own cap was 200, so a 50-row "revenue by state" answer was
+        written from the first 20 states — and `truncated` said False, because
+        that flag only tracks the 200 cap. Two different limits, one of them
+        invisible: the model had no way to know it was reasoning about a
+        fraction of the result.
 
         Falls back to a hand-rolled table if `tabulate` is absent. pandas treats
         it as an optional extra, so a missing install surfaces as an ImportError
@@ -116,13 +140,17 @@ class QueryResult:
         """
         if self.is_empty:
             return "(no rows)"
-        head = self.dataframe.head(max_rows)
+        head = self.dataframe if max_rows is None else self.dataframe.head(max_rows)
         try:
             body = head.to_markdown(index=False)
         except ImportError:
             body = _plain_table(head)
-        if self.row_count > max_rows:
-            body += f"\n\n… {self.row_count - max_rows} more row(s) not shown"
+        hidden = self.row_count - len(head)
+        if hidden > 0:
+            body += (
+                f"\n\n… {hidden} more row(s) not shown, of {self.row_count} total. "
+                "Aggregate further or add a LIMIT if you need them all."
+            )
         return body
 
 
@@ -177,10 +205,30 @@ def _classify(err: Exception) -> QueryError:
 
     if isinstance(err, (gexc.Forbidden, gexc.Unauthorized)):
         return QueryError(QueryErrorKind.PERMISSION, message)
+
+    # Credentials that cannot be obtained or refreshed, and raw transport
+    # failures, never reach google.api_core's exception types — so they landed
+    # in UNKNOWN and the agent treated "the laptop lost its network" the same as
+    # "the model wrote odd SQL".
+    if type(err).__name__ in {
+        "DefaultCredentialsError", "RefreshError", "UserAccessTokenError",
+    }:
+        return QueryError(
+            QueryErrorKind.PERMISSION,
+            f"{message}. Run `gcloud auth application-default login`.",
+        )
     if isinstance(err, gexc.NotFound):
         return QueryError(QueryErrorKind.NOT_FOUND, message)
+    # Ahead of the socket-error test below, because TimeoutError is a subclass
+    # of OSError: checking sockets first classified every query timeout as a
+    # dropped connection, and stopped the timed-out job from being cancelled.
     if isinstance(err, (gexc.DeadlineExceeded, TimeoutError)):
         return QueryError(QueryErrorKind.TIMEOUT, message)
+    if isinstance(err, (ConnectionError, OSError)) or type(err).__name__ in {
+        "ConnectionError", "ConnectTimeout", "ReadTimeout", "TransportError",
+        "ServerNotFoundError",
+    }:
+        return QueryError(QueryErrorKind.TRANSIENT, message)
     if isinstance(
         err,
         (
@@ -193,6 +241,21 @@ def _classify(err: Exception) -> QueryError:
         return QueryError(QueryErrorKind.TRANSIENT, message)
 
     return QueryError(QueryErrorKind.UNKNOWN, message)
+
+
+def _cancel_quietly(job: Any, tracer: Tracer | None) -> None:
+    """Best-effort cancel of a job we have stopped waiting for."""
+    cancel = getattr(job, "cancel", None)
+    if not callable(cancel):
+        return
+    try:
+        cancel()
+    except Exception as err:  # noqa: BLE001 - cancelling must never mask the timeout
+        if tracer:
+            tracer.emit("bq.cancel_failed", error=str(err))
+    else:
+        if tracer:
+            tracer.emit("bq.cancelled", job_id=str(getattr(job, "job_id", "")))
 
 
 @dataclass
@@ -298,6 +361,10 @@ class BigQueryRunner:
 
         if tracer:
             tracer.metrics.sql_attempts += 1
+            # The SQL that actually reaches BigQuery, which is not the SQL the
+            # model wrote. Without it a trace cannot answer the one question an
+            # entitlement incident turns on: what did this user's query run as?
+            tracer.emit("sql.rewritten", sql=guarded.sql, scope_applied=guarded.rewritten)
             if guarded.rewritten:
                 tracer.audit(
                     "scope_applied", tables=sorted(guarded.tables), user=scope.user_id
@@ -316,9 +383,12 @@ class BigQueryRunner:
         dataframe, bytes_processed = self._run_with_retries(guarded.sql, tracer=tracer)
 
         cleaned, redactions = scrub_dataframe(dataframe)
+        cleaned, pseudonymised = pseudonymize_customer_ids(cleaned)
         if redactions and tracer:
             tracer.metrics.pii_redactions += len(redactions)
             tracer.audit("pii_redacted", where="query_result", details=redactions)
+        if pseudonymised and tracer:
+            tracer.audit("pseudonymised", where="query_result", columns=pseudonymised)
 
         truncated = len(cleaned) > self.max_rows
         if truncated:
@@ -391,15 +461,72 @@ class BigQueryRunner:
         return config
 
     def _dry_run(self, sql: str, *, tracer: Tracer | None) -> int:
-        self._breaker.check(time.monotonic())
-        try:
+        """Estimate the cost, with the same retries and breaker as a real run.
+
+        This is the FIRST call of every query, so a warehouse outage always
+        fails here — and while this path had neither retries nor breaker
+        accounting, the breaker could never open no matter how long BigQuery
+        was down, and a single 503 blip failed a query that one retry would
+        have completed.
+        """
+        def attempt() -> int:
             job = self.client.query(sql, job_config=self._job_config(dry_run=True))
-        except Exception as err:  # noqa: BLE001
-            raise _classify(err) from err
-        estimated = int(getattr(job, "total_bytes_processed", 0) or 0)
+            return int(getattr(job, "total_bytes_processed", 0) or 0)
+
+        # A dry run is planning only: it keeps answering while the execution
+        # engine is degraded, so its failures are evidence the warehouse is
+        # unwell, but its successes are not evidence that it is well. Letting it
+        # clear the breaker would erase the record of the real queries failing.
+        estimated = self._with_retries(
+            attempt, tracer=tracer, what="dry_run", counts_as_healthy=False
+        )
         if tracer:
             tracer.emit("bq.dry_run", estimated_bytes=estimated)
         return estimated
+
+    def _with_retries(
+        self,
+        attempt: Callable[[], Any],
+        *,
+        tracer: Tracer | None,
+        what: str,
+        counts_as_healthy: bool = True,
+    ) -> Any:
+        """Run one BigQuery interaction, retrying only what is worth retrying."""
+        last: QueryError | None = None
+        for number in range(1, self.max_attempts + 1):
+            self._breaker.check(time.monotonic())
+            try:
+                result = attempt()
+            except Exception as err:  # noqa: BLE001
+                # A QueryError from here is already classified (the client
+                # property raises PERMISSION when credentials are missing);
+                # re-classifying it would demote that to UNKNOWN.
+                error = err if isinstance(err, QueryError) else _classify(err)
+                if not error.retryable:
+                    if counts_as_healthy:
+                        self._breaker.reset()
+                    raise error from err
+                last = error
+                self._breaker.record_failure(time.monotonic())
+                if tracer:
+                    tracer.metrics.retries += 1
+                    tracer.emit(
+                        "bq.retry", attempt=number, phase=what, kind=str(error.kind),
+                        error=error.message,
+                    )
+                if number < self.max_attempts:
+                    # Exponential backoff with jitter, so concurrent sessions do
+                    # not retry in lockstep against a struggling service.
+                    self._sleep(min(2 ** (number - 1), 8) * (0.5 + random.random()))
+                continue
+            else:
+                if counts_as_healthy:
+                    self._breaker.reset()
+                return result
+
+        assert last is not None
+        raise last
 
     def _run_with_retries(
         self, sql: str, *, tracer: Tracer | None
@@ -407,11 +534,26 @@ class BigQueryRunner:
         last: QueryError | None = None
         for attempt in range(1, self.max_attempts + 1):
             self._breaker.check(time.monotonic())
+            job = None
             try:
                 job = self.client.query(sql, job_config=self._job_config(dry_run=False))
-                dataframe = job.result(timeout=self.timeout_s).to_dataframe()
+                # REST download, not the Storage API. google-cloud-bigquery-
+                # storage is deliberately not a dependency (it pulls in gRPC),
+                # and result sets here are row-capped well below the size where
+                # it would pay off. Saying so explicitly also stops the client
+                # from warning "BigQuery Storage module not found" on every
+                # query -- it checks this flag before attempting the import.
+                dataframe = job.result(timeout=self.timeout_s).to_dataframe(
+                    create_bqstorage_client=False,
+                )
             except Exception as err:  # noqa: BLE001
                 error = err if isinstance(err, QueryError) else _classify(err)
+                if error.kind is QueryErrorKind.TIMEOUT:
+                    # We stopped waiting; BigQuery did not stop working. Without
+                    # this the retry submits a second job while the first one
+                    # runs on and bills, so a slow query was charged up to three
+                    # times over for one answer.
+                    _cancel_quietly(job, tracer)
                 if not error.retryable:
                     self._breaker.reset()
                     raise error from err
@@ -420,8 +562,8 @@ class BigQueryRunner:
                 if tracer:
                     tracer.metrics.retries += 1
                     tracer.emit(
-                        "bq.retry", attempt=attempt, kind=str(error.kind),
-                        error=error.message,
+                        "bq.retry", attempt=attempt, phase="execute",
+                        kind=str(error.kind), error=error.message,
                     )
                 if attempt < self.max_attempts:
                     # Exponential backoff with jitter, so concurrent sessions do
