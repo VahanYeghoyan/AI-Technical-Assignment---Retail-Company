@@ -21,6 +21,7 @@ import uuid
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -35,6 +36,20 @@ from retail_agent.reports import ReportStore
 from retail_agent.safety.scope import UnknownUserError, get_scope, load_scopes
 
 console = Console()
+
+
+def _safe(value: object) -> str:
+    """Render untrusted text as itself, not as Rich markup.
+
+    Report titles, questions and error strings all reach a Table cell or a
+    print(), and Rich parses square brackets in them as style tags. A title like
+    "Q1 [/b] review" raised MarkupError out of /reports — and the REPL's own
+    handler then printed the same brackets inside the error text, raising again
+    from the except block and taking the process down. A renderer must not be
+    able to crash on the text it is asked to render.
+    """
+    return escape(str(value))
+
 
 BANNER = """\
 [bold]Retail analysis assistant[/bold]
@@ -83,7 +98,9 @@ def _render_reports(reports: tuple) -> None:
     table.add_column("title")
     table.add_column("created")
     for report in reports:
-        table.add_row(report.report_id[:8], report.title, report.created_at[:10])
+        table.add_row(
+            report.report_id[:8], _safe(report.title), report.created_at[:10]
+        )
     console.print(table)
 
 
@@ -102,7 +119,9 @@ def _render_trace_events(outcome: Outcome) -> None:
             if k not in {"ts", "trace_id", "span_id", "parent_span_id", "event",
                          "user_id", "conversation_id"}
         }
-        table.add_row(event["ts"][11:23], event["event"], str(detail)[:160])
+        table.add_row(
+            event["ts"][11:23], _safe(event["event"]), _safe(str(detail)[:160])
+        )
     console.print(table)
 
 
@@ -120,8 +139,8 @@ def _render_trace_turns(outcome: Outcome) -> None:
         metrics = turn.get("metrics", {})
         table.add_row(
             turn["trace_id"],
-            str(turn.get("question", ""))[:60],
-            turn.get("status", "?"),
+            _safe(str(turn.get("question", ""))[:60]),
+            _safe(turn.get("status", "?")),
             str(metrics.get("llm_calls", "")),
             str(metrics.get("sql_attempts", "")),
         )
@@ -141,7 +160,7 @@ def _render_answer(outcome: Outcome) -> None:
         )
     if result.status not in {"ok", "awaiting_confirmation"}:
         console.print(
-            f"[dim]status: {result.status} · trace {result.trace_id} "
+            f"[dim]status: {_safe(result.status)} · trace {result.trace_id} "
             f"(/trace {result.trace_id})[/dim]"
         )
     console.print()
@@ -175,9 +194,10 @@ def render(agent: Agent, outcome: Outcome) -> None:
     elif outcome.kind is Kind.WHOAMI:
         console.print(
             Panel(
-                f"[bold]{agent.scope.display_name or agent.scope.user_id}[/bold]"
-                f"{f' — {agent.scope.title}' if agent.scope.title else ''}\n"
-                f"Scope: {agent.scope.describe()}\n"
+                f"[bold]{_safe(agent.scope.display_name or agent.scope.user_id)}"
+                "[/bold]"
+                f"{f' — {_safe(agent.scope.title)}' if agent.scope.title else ''}\n"
+                f"Scope: {_safe(agent.scope.describe())}\n"
                 f"Persona version: {persona_version()}\n"
                 f"Conversation: {agent.conversation_id}",
                 title="whoami",
@@ -189,7 +209,9 @@ def render(agent: Agent, outcome: Outcome) -> None:
             "[dim](re-read from config/persona.yaml on every turn)[/dim]"
         )
     elif outcome.kind is Kind.UNKNOWN_COMMAND:
-        console.print(f"[yellow]Unknown command /{outcome.text}. Try /help.[/yellow]")
+        console.print(
+            f"[yellow]Unknown command /{_safe(outcome.text)}. Try /help.[/yellow]"
+        )
     elif outcome.kind is Kind.ANSWER:
         _render_answer(outcome)
 
@@ -220,22 +242,25 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_users:
         for user_id, scope in load_scopes().items():
-            console.print(f"  {user_id:8} {scope.title or '':34} {scope.describe()}")
+            console.print(
+                f"  {user_id:8} {_safe(scope.title or ''):34} {_safe(scope.describe())}"
+            )
         return 0
 
     try:
         agent = build_agent(args.user, conversation_id=uuid.uuid4().hex[:12])
     except UnknownUserError as err:
-        console.print(f"[red]{err}[/red]")
+        console.print(f"[red]{_safe(err)}[/red]")
         return 2
     except LLMConfigError as err:
-        console.print(f"[red]{err}[/red]")
+        console.print(f"[red]{_safe(err)}[/red]")
         return 2
 
     console.print(Panel(BANNER, border_style="dim"))
     console.print(
-        f"[dim]Signed in as {agent.scope.display_name or args.user} · "
-        f"scope: {agent.scope.describe()} · persona v{persona_version()}[/dim]\n"
+        f"[dim]Signed in as {_safe(agent.scope.display_name or args.user)} · "
+        f"scope: {_safe(agent.scope.describe())} · "
+        f"persona v{_safe(persona_version())}[/dim]\n"
     )
 
     while True:
@@ -249,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                 console.print("[dim]Bye.[/dim]")
                 return 0
         except Exception as err:  # noqa: BLE001 - the REPL must survive anything
-            console.print(f"[red]Unexpected error:[/red] {err}")
+            console.print(f"[red]Unexpected error:[/red] {_safe(err)}")
 
 
 if __name__ == "__main__":

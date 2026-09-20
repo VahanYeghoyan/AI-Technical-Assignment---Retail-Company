@@ -206,11 +206,14 @@ def read_events(
     *,
     trace_id: str | None = None,
     conversation_id: str | None = None,
+    user_id: str | None = None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Load events from the JSONL sink, newest file last.
 
     This backs the CLI's /trace command: the deep-dive path from Requirement 7.
+    Pass `user_id` to see only one user's turns — what a chat frontend should
+    always do, since a trace carries the question, the rows and the answer.
     """
     directory = Path(trace_dir or os.getenv("TRACE_DIR") or _DEFAULT_TRACE_DIR)
     if not directory.exists():
@@ -227,6 +230,8 @@ def read_events(
             if trace_id and record.get("trace_id") != trace_id:
                 continue
             if conversation_id and record.get("conversation_id") != conversation_id:
+                continue
+            if user_id and record.get("user_id") != user_id:
                 continue
             events.append(record)
     return events[-limit:] if limit else events

@@ -119,7 +119,12 @@ def dispatch(
         return [Outcome(Kind.DELETED, delete_outcome=deleted)]
 
     if verdict == "cancel":
-        agent.broker.cancel(agent.scope.user_id)
+        cancelled = agent.broker.cancel(agent.scope.user_id)
+        agent.tracer.audit(
+            "deletion_cancelled",
+            count=len(cancelled.targets) if cancelled else 0,
+            criteria=cancelled.criteria if cancelled else "",
+        )
         outcomes.append(Outcome(Kind.CANCELLED))
         if stripped.lower() in _PURE_NEGATIVES:
             return outcomes
@@ -162,6 +167,13 @@ def _slash_command(agent: Agent, stripped: str) -> Outcome:
 
     if command == "undo":
         restored = agent.store.restore(agent.last_deleted, actor=agent.scope.user_id)
+        # A restore changes who can see what, exactly as a delete does, so it
+        # belongs in the same audit stream rather than nowhere.
+        agent.tracer.audit(
+            "reports_restored",
+            count=len(restored),
+            report_ids=[r.report_id for r in restored],
+        )
         return Outcome(Kind.UNDO, restored=restored)
 
     if command == "trace":
@@ -169,7 +181,13 @@ def _slash_command(agent: Agent, stripped: str) -> Outcome:
             return Outcome(
                 Kind.TRACE_EVENTS,
                 trace_id=argument,
-                events=tuple(read_events(trace_id=argument)),
+                # Scoped to the caller. A trace holds the question, the SQL and
+                # the answer, so an unfiltered lookup by id let one executive
+                # read another's analysis — including the figures their own
+                # entitlements are there to keep from them.
+                events=tuple(
+                    read_events(trace_id=argument, user_id=agent.scope.user_id)
+                ),
             )
         turns = summarise_turns(read_events(conversation_id=agent.conversation_id))
         return Outcome(Kind.TRACE_TURNS, turns=tuple(turns))

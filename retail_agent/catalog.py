@@ -123,7 +123,12 @@ TABLES: tuple[Table, ...] = (
         name="users",
         grain="customer",
         columns=(
-            Column("id", "INTEGER", "primary key"),
+            Column(
+                "id",
+                "INTEGER",
+                "primary key — alias it as user_id when selecting; it comes back "
+                "pseudonymised as CUST-xxxxxx",
+            ),
             Column("age", "INTEGER", "aggregate only"),
             Column("gender", "STRING", "aggregate only"),
             Column("state", "STRING", "aggregate only"),
