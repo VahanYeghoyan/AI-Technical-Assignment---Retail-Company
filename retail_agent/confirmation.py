@@ -65,6 +65,9 @@ class PendingDeletion:
     criteria: str
     created_at: datetime
     ttl_seconds: int = DEFAULT_TTL_SECONDS
+    # How the match set was resolved: "text", "conversation", "ids", "all", or
+    # "none" when the request named nothing to match on.
+    selector: str = "text"
 
     @property
     def expires_at(self) -> datetime:
@@ -79,6 +82,13 @@ class PendingDeletion:
 
     def prompt(self) -> str:
         """The exact text shown to the user before they confirm."""
+        if self.selector == "none":
+            return (
+                "I need to know which reports you mean before I can delete "
+                "anything — name the client or topic they mention, say \"the "
+                "ones from this conversation\", or say \"all my reports\" if "
+                "you really do mean every one of them."
+            )
         if not self.targets:
             base = f"Nothing matches {self.criteria!r}, so there is nothing to delete."
             if self.not_owned:
@@ -131,13 +141,44 @@ class ConfirmationBroker:
         conversation_id: str | None = None,
         report_ids: Sequence[str] | None = None,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        all_reports: bool = False,
     ) -> PendingDeletion:
         """Resolve a deletion request to a concrete, itemised match set.
 
         `criteria` is the human description echoed back to the user ("mentioning
         Client X", "created in this conversation"), so the confirmation prompt
         always says what it is about to act on.
+
+        A request with no selector at all is refused rather than treated as
+        "everything". An empty `text` used to fall through to an unfiltered
+        search, so a model that described the criteria but forgot to pass the
+        text it was matching on armed a delete-all — labelled, in the user's own
+        words, as "mentioning Client X". Deleting everything has to be asked for,
+        with `all_reports`, not arrived at by omission.
         """
+        selector = (
+            "ids" if report_ids
+            else "text" if text
+            else "conversation" if conversation_id
+            else "all" if all_reports
+            else "none"
+        )
+        if selector == "none":
+            self._pending.pop(actor, None)
+            return PendingDeletion(
+                action_id=uuid.uuid4().hex[:12],
+                actor=actor,
+                targets=(),
+                not_owned=(),
+                criteria=criteria,
+                created_at=datetime.now(UTC),
+                ttl_seconds=ttl_seconds,
+                selector=selector,
+            )
+        if selector == "all":
+            # Say what it is, not what the model called it.
+            criteria = "ALL of your saved reports"
+
         if report_ids:
             resolved = [self.store.resolve_id(rid) for rid in report_ids]
             targets = tuple(r for r in resolved if r and not r.is_deleted)
@@ -165,6 +206,7 @@ class ConfirmationBroker:
             criteria=criteria,
             created_at=datetime.now(UTC),
             ttl_seconds=ttl_seconds,
+            selector=selector,
         )
         if targets:
             self._pending[actor] = pending

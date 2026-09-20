@@ -7,6 +7,8 @@ model can never delete anything" — are provable with no credentials and no quo
 
 from __future__ import annotations
 
+import sqlite3
+
 import pandas as pd
 import pytest
 
@@ -146,6 +148,99 @@ def test_history_omits_thought_signature_when_absent(tmp_path, store):
     assert "thought_signature" not in call_parts[0]
 
 
+def calls(*specs) -> LLMResponse:
+    """One model response carrying several tool calls, as Gemini returns them."""
+    return LLMResponse(
+        function_calls=tuple(
+            FunctionCall(name=name, args=args, thought_signature=signature)
+            for name, args, signature in specs
+        ),
+        model="stub",
+    )
+
+
+def history_faults(history) -> list[str]:
+    """Structural rules the Gemini API enforces on `contents`.
+
+    The stub provider accepts any history at all, which is how a malformed one
+    reached production: the call and its response have to pair up, one turn to
+    one turn, or the request is rejected outright.
+    """
+    faults: list[str] = []
+    for index, message in enumerate(history):
+        made = [p for p in message["parts"] if "function_call" in p]
+        answered = [p for p in message["parts"] if "function_response" in p]
+        if made:
+            following = history[index + 1] if index + 1 < len(history) else {"parts": []}
+            replies = [p for p in following["parts"] if "function_response" in p]
+            if len(replies) != len(made):
+                faults.append(
+                    f"entry {index}: {len(made)} call(s), {len(replies)} response(s)"
+                )
+        if answered:
+            previous = history[index - 1] if index else {"parts": []}
+            if not any("function_call" in p for p in previous["parts"]):
+                faults.append(f"entry {index}: response with no preceding call")
+    return faults
+
+
+def test_parallel_tool_calls_stay_in_one_model_turn(tmp_path, store):
+    # Gemini returns parallel calls as several parts of ONE content and signs
+    # only the first. Appending a turn per call left the second call unsigned,
+    # and the next request died on "400 Function call is missing a
+    # thought_signature" — after both queries had run and been billed.
+    agent = build(
+        tmp_path,
+        store,
+        [
+            calls(
+                ("describe_schema", {"table": "orders"}, b"sig-1"),
+                ("describe_schema", {"table": "users"}, None),
+            ),
+            text("Both tables have data."),
+        ],
+    )
+
+    agent.ask("describe orders and users")
+
+    model_turns = [
+        m for m in agent.history if any("function_call" in p for p in m["parts"])
+    ]
+    assert len(model_turns) == 1, "both calls belong to one model turn"
+    assert len(model_turns[0]["parts"]) == 2
+    assert model_turns[0]["parts"][0]["thought_signature"] == b"sig-1"
+    assert "thought_signature" not in model_turns[0]["parts"][1]
+    assert history_faults(agent.history) == []
+
+
+def test_a_deletion_proposal_leaves_no_unanswered_call(tmp_path, store):
+    store.save(owner="maya", conversation_id="conv-1", title="Acme review", body="x")
+    agent = build(
+        tmp_path,
+        store,
+        [call("propose_delete_reports", criteria="mentioning Acme", text="Acme")],
+    )
+
+    agent.ask("delete reports mentioning Acme")
+
+    assert history_faults(agent.history) == []
+
+
+def test_giving_up_on_sql_leaves_no_unanswered_call(tmp_path, store):
+    from google.api_core import exceptions as gexc
+
+    agent = build(
+        tmp_path,
+        store,
+        [call("run_analysis_sql", sql="SELECT FROM orders")] * 10,
+        bq_client=FakeBQClient(behaviours=[gexc.BadRequest("Syntax error: nope")] * 10),
+    )
+
+    agent.ask("how many orders?")
+
+    assert history_faults(agent.history) == []
+
+
 def test_describe_schema_needs_no_database(tmp_path, store):
     agent = build(tmp_path, store, [call("describe_schema"), text("Four tables.")])
     result = agent.ask("what data do you have?")
@@ -233,6 +328,72 @@ def test_self_correction_is_bounded(tmp_path, store):
     assert result.status == "sql_unrecoverable"
     assert "could not build a working query" in result.answer
     assert len(client.executed) <= MAX_SQL_CORRECTIONS + 1
+
+
+def test_a_failure_the_model_cannot_fix_ends_the_turn_at_once(tmp_path, store):
+    from google.api_core import exceptions as gexc
+
+    # No rewrite fixes refused credentials. This used to go back to the model as
+    # an ordinary failed tool call, so it rewrote the query, failed identically,
+    # and the turn ended on the call budget advising the user to "narrow the
+    # question" — eight model calls and eight BigQuery attempts to say nothing.
+    client = FakeBQClient(behaviours=[gexc.Forbidden("no access")] * 10)
+    agent = build(
+        tmp_path,
+        store,
+        [call("run_analysis_sql", sql="SELECT COUNT(*) AS n FROM orders")] * 10,
+        bq_client=client,
+    )
+
+    result = agent.ask("how many orders?")
+
+    assert result.status == "warehouse_permission"
+    assert "credentials" in result.answer
+    assert agent.tracer.metrics.llm_calls == 1
+    assert len(client.executed) == 1
+
+
+def test_a_warehouse_outage_is_named_as_such(tmp_path, store):
+    from google.api_core import exceptions as gexc
+
+    client = FakeBQClient(behaviours=[gexc.ServiceUnavailable("down")] * 20)
+    agent = build(
+        tmp_path,
+        store,
+        [call("run_analysis_sql", sql="SELECT COUNT(*) AS n FROM orders")] * 10,
+        bq_client=client,
+    )
+
+    result = agent.ask("how many orders?")
+
+    assert result.status == "warehouse_unavailable"
+    assert "not responding" in result.answer
+    assert history_faults(agent.history) == []
+
+
+def test_the_model_sees_every_row_the_runner_kept(tmp_path, store):
+    # The rendering cap was 20 while the runner's cap was 200, so a 50-row
+    # answer was written from the first 20 rows — with truncated=False, because
+    # that flag only tracks the 200. Two limits, one of them invisible.
+    frame = pd.DataFrame({"state": [f"S{i}" for i in range(50)], "rev": range(50)})
+    agent = build(
+        tmp_path,
+        store,
+        [call("run_analysis_sql", sql="SELECT state, 1 AS rev FROM users GROUP BY state"),
+         text("done")],
+        bq_client=FakeBQClient(dataframe=frame),
+    )
+
+    agent.ask("revenue by state")
+
+    rows = [
+        part["function_response"]["response"]
+        for message in agent.history
+        for part in message["parts"]
+        if "function_response" in part
+    ][0]
+    assert rows["row_count"] == 50
+    assert rows["rows"].count("| S") == 50
 
 
 def test_cost_rejection_asks_the_user_to_narrow(tmp_path, store):
@@ -333,6 +494,82 @@ def test_save_report_persists_it(tmp_path, store):
     assert store.list_for_user("maya")[0].title == "Q1 review"
 
 
+def test_report_bodies_are_scrubbed_before_they_are_stored(tmp_path, store):
+    # The final answer is scrubbed on its way to the screen, but a report is
+    # written to storage and read back days later — so the library was the one
+    # place a leaked address could settle permanently.
+    agent = build(
+        tmp_path,
+        store,
+        [
+            call(
+                "save_report",
+                title="Top customer",
+                body="Contact jane.doe@example.com at 6389 Pine Drive.",
+                entities=["Acme"],
+            ),
+            text("Saved."),
+        ],
+    )
+
+    agent.ask("save that")
+
+    saved = store.list_for_user("maya")[0]
+    assert "jane.doe@example.com" not in saved.body
+    assert "REDACTED_EMAIL" in saved.body and "REDACTED_ADDRESS" in saved.body
+    assert agent.tracer.metrics.pii_redactions >= 1
+
+
+def test_entities_given_as_a_bare_string_do_not_become_characters(tmp_path, store):
+    agent = build(
+        tmp_path,
+        store,
+        [call("save_report", title="T", body="B", entities="Levi's"), text("Saved.")],
+    )
+
+    agent.ask("save that")
+
+    assert store.list_for_user("maya")[0].entities == ("Levi's",)
+
+
+def test_a_deletion_with_no_selector_is_refused_rather_than_matching_everything(
+    tmp_path, store
+):
+    # `criteria` is the only required argument, so a model that described the
+    # match but forgot to pass `text` armed a delete-all — labelled, in the
+    # user's own words, "mentioning Client X".
+    for title in ["Acme Q1", "Board pack", "Denim deep dive", "Swim season"]:
+        store.save(owner="maya", conversation_id="old", title=title, body="...")
+    agent = build(
+        tmp_path, store, [call("propose_delete_reports", criteria="mentioning Client X")]
+    )
+
+    result = agent.ask("delete all reports mentioning Client X")
+
+    assert agent.broker.pending_for("maya") is None
+    assert result.pending_deletion is None
+    assert "which reports" in result.answer
+    assert all(not r.is_deleted for r in store.list_for_user("maya"))
+
+
+def test_deleting_everything_must_be_asked_for_explicitly(tmp_path, store):
+    for title in ["Acme Q1", "Board pack", "Denim deep dive", "Swim season"]:
+        store.save(owner="maya", conversation_id="old", title=title, body="...")
+    agent = build(
+        tmp_path,
+        store,
+        [call("propose_delete_reports", criteria="everything", all_reports=True)],
+    )
+
+    result = agent.ask("delete all my reports")
+
+    assert result.status == "awaiting_confirmation"
+    assert len(result.pending_deletion.targets) == 4
+    # Named for what it is, not for whatever the model called it.
+    assert "ALL of your saved reports" in result.answer
+    assert "delete 4" in result.answer  # and still needs the count typed
+
+
 def test_delete_request_returns_a_proposal_not_a_deletion(tmp_path, store):
     report = store.save(
         owner="maya", conversation_id="conv-1", title="Acme review", body="x"
@@ -402,6 +639,59 @@ def test_deletion_is_audited(tmp_path, store):
     assert "audit.reports_deleted" in audited
 
 
+def test_undo_is_audited(tmp_path, store):
+    # A restore changes who can see what, exactly as a delete does.
+    store.save(owner="maya", conversation_id="conv-1", title="Acme", body="x")
+    agent = build(
+        tmp_path,
+        store,
+        [call("propose_delete_reports", criteria="mentioning Acme", text="Acme")],
+    )
+    agent.ask("delete reports mentioning Acme")
+    cli.handle_input(agent, "yes")
+    cli.handle_input(agent, "/undo")
+
+    audited = [e["event"] for e in read_events(tmp_path / "traces") if e.get("audit")]
+    assert "audit.reports_restored" in audited
+
+
+def test_trace_lookup_is_scoped_to_the_caller(tmp_path, store):
+    from retail_agent.dispatch import dispatch
+
+    maya = build(tmp_path, store, [text("Women's revenue was $5.0M.")])
+    result = maya.ask("what was my revenue?")
+
+    sam = build(tmp_path, store, [], scope=Scope(user_id="sam",
+                                                 departments=frozenset({"Men"})))
+    outcome = dispatch(sam, f"/trace {result.trace_id}")[0]
+
+    assert outcome.events == ()  # another user's turn is not sam's to replay
+
+
+def test_a_trace_replays_the_prompt_and_what_the_model_was_handed(tmp_path, store):
+    # "Replays the whole correspondence" has to include the two halves that were
+    # missing: the prompt the model was given, and the rows it got back.
+    client = FakeBQClient(dataframe=pd.DataFrame({"brand": ["Levi's"], "rev": [12.5]}))
+    agent = build(
+        tmp_path,
+        store,
+        [call("run_analysis_sql", sql="SELECT brand, 1 AS rev FROM products"),
+         text("Levi's leads.")],
+        bq_client=client,
+    )
+    result = agent.ask("top brand?")
+
+    events = read_events(tmp_path / "traces", trace_id=result.trace_id)
+    by_name = {e["event"]: e for e in events}
+
+    assert "prompt.built" in by_name
+    assert by_name["prompt.built"]["system_sha"]
+    # The scope-rewritten SQL — what actually reached BigQuery, not what the
+    # model wrote — and the rows that came back.
+    assert "department IN ('Women')" in by_name["sql.rewritten"]["sql"]
+    assert "Levi's" in str(by_name["tool.result"]["response"])
+
+
 def test_slash_commands_work_while_the_model_is_down(tmp_path, store):
     class Down(StubProvider):
         def generate(self, **kwargs):
@@ -457,3 +747,24 @@ def test_scope_appears_in_the_prompt(tmp_path):
     prompt = build_system_prompt(WOMENS)
     assert "Women" in prompt
     assert "Maya Cohen" in prompt
+
+
+def test_a_crashing_tool_still_answers_its_call(tmp_path, store):
+    # The history has to stay well formed even when a tool fails in a way no
+    # one anticipated — an unanswered call is carried by every later turn.
+    agent = build(
+        tmp_path,
+        store,
+        [call("list_reports"), text("I could not read your reports just now.")],
+    )
+
+    def explode(**kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    agent.store.search = explode
+
+    result = agent.ask("show me my reports")
+
+    assert result.status == "ok"
+    assert history_faults(agent.history) == []
+    assert any("OperationalError" in str(m) for m in agent.history)

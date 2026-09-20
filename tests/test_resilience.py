@@ -50,7 +50,7 @@ class FakeJob:
     def result(self, timeout=None):  # noqa: ARG002
         return self
 
-    def to_dataframe(self):
+    def to_dataframe(self, create_bqstorage_client=None):  # noqa: ARG002
         return self._dataframe
 
 
@@ -206,6 +206,106 @@ def test_permission_error_is_not_retried():
         runner(client).execute(SIMPLE_SQL, UNRESTRICTED)
     assert err.value.kind is QueryErrorKind.PERMISSION
     assert len(client.executed) == 1
+
+
+def test_a_dry_run_blip_is_retried_rather_than_failing_the_query():
+    # The dry run is the FIRST call of every query, and it had neither retries
+    # nor breaker accounting — so one 503 there failed a query that a single
+    # retry would have completed.
+    class BlipOnFirstCall(FakeBQClient):
+        def __init__(self):
+            super().__init__()
+            self.first = True
+
+        def query(self, sql, job_config=None):
+            if self.first:
+                self.first = False
+                raise gexc.ServiceUnavailable("503 blip")
+            return super().query(sql, job_config)
+
+    result = runner(BlipOnFirstCall()).execute(SIMPLE_SQL, UNRESTRICTED)
+    assert result.row_count == 1
+
+
+def test_the_breaker_opens_when_the_outage_hits_the_dry_run():
+    # A real outage fails at the dry run, before execution is ever reached. With
+    # failures counted only during execution, the breaker could never open no
+    # matter how long BigQuery stayed down.
+    class AlwaysDown(FakeBQClient):
+        def query(self, sql, job_config=None):
+            self.queries.append(sql)
+            raise gexc.ServiceUnavailable("503 backend error")
+
+    client = AlwaysDown()
+    bq = runner(client, max_attempts=2)
+    for _ in range(3):
+        with pytest.raises(QueryError) as err:
+            bq.execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert err.value.kind is QueryErrorKind.CIRCUIT_OPEN
+    assert len(client.queries) == 4  # threshold reached, then fails fast
+
+
+def test_a_timed_out_job_is_cancelled_before_the_retry():
+    # We stop waiting; BigQuery does not stop working. Retrying without
+    # cancelling left the first job running and billing, so one slow answer was
+    # paid for up to three times.
+    cancels = []
+
+    class NeverFinishes:
+        def __init__(self):
+            self.job_id = "job-1"
+            self.total_bytes_processed = 10
+
+        def result(self, timeout=None):  # noqa: ARG002
+            raise TimeoutError("job still running")
+
+        def cancel(self):
+            cancels.append(self.job_id)
+
+    class SlowClient(FakeBQClient):
+        def query(self, sql, job_config=None):
+            if job_config is not None and getattr(job_config, "dry_run", False):
+                return super().query(sql, job_config)
+            self.executed.append(sql)
+            return NeverFinishes()
+
+    client = SlowClient()
+    with pytest.raises(QueryError) as err:
+        runner(client, max_attempts=3).execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert err.value.kind is QueryErrorKind.TIMEOUT
+    assert len(cancels) == len(client.executed) == 3
+
+
+def test_lost_credentials_are_a_permission_error_not_a_mystery():
+    # google.auth raises these, and they are not google.api_core types — so they
+    # fell into UNKNOWN and the agent treated an expired login as odd SQL.
+    class RefreshError(Exception):
+        pass
+
+    RefreshError.__name__ = "RefreshError"
+
+    class NoCredentials(FakeBQClient):
+        def query(self, sql, job_config=None):
+            raise RefreshError("could not refresh the access token")
+
+    with pytest.raises(QueryError) as err:
+        runner(NoCredentials()).execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert err.value.kind is QueryErrorKind.PERMISSION
+    assert err.value.retriable_by_model is False
+
+
+def test_a_dropped_network_is_transient_not_unknown():
+    class Offline(FakeBQClient):
+        def query(self, sql, job_config=None):
+            raise ConnectionError("Max retries exceeded: network unreachable")
+
+    with pytest.raises(QueryError) as err:
+        runner(Offline(), max_attempts=2).execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert err.value.kind is QueryErrorKind.TRANSIENT
 
 
 def test_circuit_breaker_opens_after_repeated_failures():
@@ -441,6 +541,47 @@ def test_exhausted_quota_is_fatal_and_not_retried():
 
     assert "will not help" in str(err.value)
     assert provider.client.models.calls == ["gemini-3.6-flash"]  # tried once only
+
+
+def test_a_per_minute_rate_limit_is_retried_not_declared_fatal():
+    # AI Studio's free tier answers a PER-MINUTE limit with a 429 that mentions
+    # both "billing" and "Quota exceeded" and ends "Please retry in 18.5s".
+    # Matching those words alone told the user the account was empty and that
+    # retrying would not help, for the rate limit this assignment says to expect.
+    from google.genai import errors as genai_errors
+
+    rate_limited = genai_errors.ClientError(
+        429,
+        {"error": {"message":
+            "You exceeded your current quota, please check your plan and billing "
+            "details. * Quota exceeded for metric: generate_content_free_tier_requests"
+            ", limit: 10\nPlease retry in 18.5s."}},
+    )
+    provider = gemini([rate_limited, _fake_genai_response("recovered")])
+
+    assert provider.generate(system="s", contents=[]).text == "recovered"
+
+
+def test_a_rate_limited_model_falls_back_to_the_secondary():
+    # Documented behaviour that was never implemented: only a 404 fell back, so
+    # a rate-limited turn failed outright with a spare model sitting idle.
+    from google.genai import errors as genai_errors
+
+    busy = genai_errors.ClientError(
+        429, {"error": {"message": "Resource exhausted, please retry in 5s"}}
+    )
+    provider = gemini(
+        [busy, busy, busy, _fake_genai_response("from fallback")],
+        model="gemini-3.6-flash",
+        fallback_model="gemini-3.1-flash-lite",
+        max_attempts=3,
+    )
+
+    response = provider.generate(system="s", contents=[])
+
+    assert response.text == "from fallback"
+    assert response.used_fallback is True
+    assert provider.client.models.calls[-1] == "gemini-3.1-flash-lite"
 
 
 def test_retired_model_falls_back_to_the_secondary():

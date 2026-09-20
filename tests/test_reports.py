@@ -326,6 +326,20 @@ def test_summarise_turns_gives_one_row_per_turn(tmp_path):
     assert {t["status"] for t in summary} == {"ok", "error"}
 
 
+def test_events_can_be_filtered_to_one_user(tmp_path):
+    # A trace holds the question, the SQL and the answer, so an unfiltered
+    # lookup by id let one executive replay another's analysis — including the
+    # figures their own entitlements exist to keep from them.
+    for user in ("maya", "sam"):
+        tracer = Tracer(user_id=user, conversation_id=f"conv-{user}", trace_dir=tmp_path)
+        tracer.start_turn(f"{user}'s question")
+        tracer.end_turn(status="ok", answer=f"{user}'s revenue figures")
+
+    mine = read_events(tmp_path, user_id="sam")
+    assert {e["user_id"] for e in mine} == {"sam"}
+    assert "maya's revenue figures" not in str(mine)
+
+
 def test_tracer_never_raises_when_the_sink_fails(tmp_path):
     tracer = Tracer(user_id="maya", conversation_id="conv-1", trace_dir=tmp_path)
     # Put a directory exactly where the JSONL file should be, so the append
