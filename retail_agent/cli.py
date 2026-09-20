@@ -2,16 +2,13 @@
 
 Run with:  python -m retail_agent.cli --user maya
 
-The one piece of real logic in here is the order of checks in handle_input():
-a live deletion confirmation is intercepted BEFORE the model is consulted. If
-"yes" were routed to the model like any other message, the model would answer it
-conversationally and the pending deletion would be lost — or worse, re-proposed
-and double-confirmed. Confirmation is a state machine in code, not a thing the
-model is trusted to remember.
+This module is a renderer. The decision of what a message *means* — a live
+deletion confirmation, a slash command, or a question for the model — lives in
+retail_agent/dispatch.py, because the Streamlit UI has to make exactly the same
+decisions in exactly the same order and a second copy of that state machine
+would eventually drift from this one. See that module for why the order matters.
 
-Slash commands are deliberately outside the model too: /undo, /reports and
-/trace must work even when the LLM is down, which — with an exhausted quota —
-is exactly the state this prototype has to stay usable in.
+What stays here is Rich: panels, tables, markdown and the input loop.
 """
 
 from __future__ import annotations
@@ -20,7 +17,6 @@ import argparse
 import os
 import sys
 import uuid
-from pathlib import Path
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -31,8 +27,9 @@ from rich.table import Table
 from retail_agent.agent import Agent
 from retail_agent.bigquery_runner import BigQueryRunner
 from retail_agent.confirmation import ConfirmationBroker
+from retail_agent.dispatch import RECENT_TURNS, Kind, Outcome, dispatch
 from retail_agent.llm import LLMConfigError, build_provider
-from retail_agent.observability import Tracer, read_events, summarise_turns
+from retail_agent.observability import Tracer
 from retail_agent.prompt import persona_version
 from retail_agent.reports import ReportStore
 from retail_agent.safety.scope import UnknownUserError, get_scope, load_scopes
@@ -74,8 +71,10 @@ def build_agent(user_id: str, *, conversation_id: str) -> Agent:
     )
 
 
-def _render_reports(agent: Agent) -> None:
-    reports = agent.store.list_for_user(agent.scope.user_id)
+# -- rendering ------------------------------------------------------------
+
+
+def _render_reports(reports: tuple) -> None:
     if not reports:
         console.print("[dim]No saved reports yet.[/dim]")
         return
@@ -88,29 +87,27 @@ def _render_reports(agent: Agent) -> None:
     console.print(table)
 
 
-def _render_trace(agent: Agent, trace_id: str | None) -> None:
-    if trace_id:
-        events = read_events(trace_id=trace_id)
-        if not events:
-            console.print(f"[yellow]No events for trace {trace_id}.[/yellow]")
-            return
-        table = Table(title=f"Trace {trace_id}", header_style="bold")
-        table.add_column("time")
-        table.add_column("event")
-        table.add_column("detail", overflow="fold")
-        for event in events:
-            detail = {
-                k: v
-                for k, v in event.items()
-                if k not in {"ts", "trace_id", "span_id", "parent_span_id", "event",
-                             "user_id", "conversation_id"}
-            }
-            table.add_row(event["ts"][11:23], event["event"], str(detail)[:160])
-        console.print(table)
+def _render_trace_events(outcome: Outcome) -> None:
+    if not outcome.events:
+        console.print(f"[yellow]No events for trace {outcome.trace_id}.[/yellow]")
         return
+    table = Table(title=f"Trace {outcome.trace_id}", header_style="bold")
+    table.add_column("time")
+    table.add_column("event")
+    table.add_column("detail", overflow="fold")
+    for event in outcome.events:
+        detail = {
+            k: v
+            for k, v in event.items()
+            if k not in {"ts", "trace_id", "span_id", "parent_span_id", "event",
+                         "user_id", "conversation_id"}
+        }
+        table.add_row(event["ts"][11:23], event["event"], str(detail)[:160])
+    console.print(table)
 
-    turns = summarise_turns(read_events(conversation_id=agent.conversation_id))
-    if not turns:
+
+def _render_trace_turns(outcome: Outcome) -> None:
+    if not outcome.turns:
         console.print("[dim]No turns recorded yet.[/dim]")
         return
     table = Table(title="Recent turns", header_style="bold")
@@ -119,7 +116,7 @@ def _render_trace(agent: Agent, trace_id: str | None) -> None:
     table.add_column("status")
     table.add_column("llm")
     table.add_column("sql")
-    for turn in turns[-15:]:
+    for turn in outcome.turns[-RECENT_TURNS:]:
         metrics = turn.get("metrics", {})
         table.add_row(
             turn["trace_id"],
@@ -132,81 +129,9 @@ def _render_trace(agent: Agent, trace_id: str | None) -> None:
     console.print("[dim]/trace <id> for the full event stream of one turn.[/dim]")
 
 
-def handle_input(agent: Agent, text: str) -> bool:
-    """Process one line. Returns False to exit.
-
-    Order matters: confirmation first, then slash commands, then the model.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return True
-
-    # 1. A pending destructive action owns the next message.
-    verdict = agent.broker.interpret(agent.scope.user_id, stripped)
-    if verdict == "confirm":
-        outcome = agent.broker.confirm(agent.scope.user_id)
-        agent.tracer.audit(
-            "reports_deleted",
-            count=outcome.deleted_count,
-            report_ids=[r.report_id for r in outcome.deleted],
-        )
-        console.print(
-            f"[green]Deleted {outcome.deleted_count} report(s).[/green] "
-            "[dim]/undo restores them.[/dim]"
-        )
-        agent.last_deleted = tuple(r.report_id for r in outcome.deleted)  # type: ignore[attr-defined]
-        return True
-    if verdict == "cancel":
-        agent.broker.cancel(agent.scope.user_id)
-        console.print("[yellow]Cancelled — nothing was deleted.[/yellow]")
-        # Deliberately fall through: the message was probably a new question.
-        if stripped.lower() in {"no", "n", "cancel", "stop", "abort"}:
-            return True
-
-    # 2. Slash commands work even when the model is unavailable.
-    if stripped.startswith("/"):
-        command, _, argument = stripped[1:].partition(" ")
-        command = command.lower()
-        if command in {"quit", "exit", "q"}:
-            return False
-        if command == "help":
-            console.print(HELP)
-        elif command == "reports":
-            _render_reports(agent)
-        elif command == "undo":
-            ids = getattr(agent, "last_deleted", ())
-            restored = agent.store.restore(ids, actor=agent.scope.user_id)
-            console.print(
-                f"[green]Restored {len(restored)} report(s).[/green]"
-                if restored
-                else "[yellow]Nothing to restore.[/yellow]"
-            )
-        elif command == "trace":
-            _render_trace(agent, argument.strip() or None)
-        elif command == "whoami":
-            console.print(
-                Panel(
-                    f"[bold]{agent.scope.display_name or agent.scope.user_id}[/bold]"
-                    f"{f' — {agent.scope.title}' if agent.scope.title else ''}\n"
-                    f"Scope: {agent.scope.describe()}\n"
-                    f"Persona version: {persona_version()}\n"
-                    f"Conversation: {agent.conversation_id}",
-                    title="whoami",
-                )
-            )
-        elif command == "persona":
-            console.print(
-                f"[bold]Persona v{persona_version()}[/bold] "
-                "[dim](re-read from config/persona.yaml on every turn)[/dim]"
-            )
-        else:
-            console.print(f"[yellow]Unknown command /{command}. Try /help.[/yellow]")
-        return True
-
-    # 3. Otherwise it is a question for the agent.
-    with console.status("[dim]analysing…[/dim]"):
-        result = agent.ask(stripped)
-
+def _render_answer(outcome: Outcome) -> None:
+    result = outcome.result
+    assert result is not None
     console.print()
     console.print(Markdown(result.answer))
     if result.saved_report_ids:
@@ -220,7 +145,66 @@ def handle_input(agent: Agent, text: str) -> bool:
             f"(/trace {result.trace_id})[/dim]"
         )
     console.print()
-    return True
+
+
+def render(agent: Agent, outcome: Outcome) -> None:
+    """Print one dispatched outcome."""
+    if outcome.kind is Kind.DELETED:
+        deleted = outcome.delete_outcome
+        assert deleted is not None
+        console.print(
+            f"[green]Deleted {deleted.deleted_count} report(s).[/green] "
+            "[dim]/undo restores them.[/dim]"
+        )
+    elif outcome.kind is Kind.CANCELLED:
+        console.print("[yellow]Cancelled — nothing was deleted.[/yellow]")
+    elif outcome.kind is Kind.HELP:
+        console.print(HELP)
+    elif outcome.kind is Kind.REPORTS:
+        _render_reports(outcome.reports)
+    elif outcome.kind is Kind.UNDO:
+        console.print(
+            f"[green]Restored {len(outcome.restored)} report(s).[/green]"
+            if outcome.restored
+            else "[yellow]Nothing to restore.[/yellow]"
+        )
+    elif outcome.kind is Kind.TRACE_EVENTS:
+        _render_trace_events(outcome)
+    elif outcome.kind is Kind.TRACE_TURNS:
+        _render_trace_turns(outcome)
+    elif outcome.kind is Kind.WHOAMI:
+        console.print(
+            Panel(
+                f"[bold]{agent.scope.display_name or agent.scope.user_id}[/bold]"
+                f"{f' — {agent.scope.title}' if agent.scope.title else ''}\n"
+                f"Scope: {agent.scope.describe()}\n"
+                f"Persona version: {persona_version()}\n"
+                f"Conversation: {agent.conversation_id}",
+                title="whoami",
+            )
+        )
+    elif outcome.kind is Kind.PERSONA:
+        console.print(
+            f"[bold]Persona v{persona_version()}[/bold] "
+            "[dim](re-read from config/persona.yaml on every turn)[/dim]"
+        )
+    elif outcome.kind is Kind.UNKNOWN_COMMAND:
+        console.print(f"[yellow]Unknown command /{outcome.text}. Try /help.[/yellow]")
+    elif outcome.kind is Kind.ANSWER:
+        _render_answer(outcome)
+
+
+def handle_input(agent: Agent, text: str) -> bool:
+    """Process one line. Returns False to exit."""
+    keep_going = True
+    for outcome in dispatch(
+        agent, text, progress=lambda: console.status("[dim]analysing…[/dim]")
+    ):
+        if outcome.kind is Kind.QUIT:
+            keep_going = False
+            continue
+        render(agent, outcome)
+    return keep_going
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,0 +1,12 @@
+# Optional web UI:  streamlit run streamlit_app.py
+#
+# Deliberately kept out of requirements.txt. The CLI is the required interface
+# and must install and run without pulling in a web stack — streamlit brings
+# pyarrow and pillow with it. Nothing under retail_agent/ imports streamlit, and
+# tests/test_streamlit_ui.py skips itself when it is not installed.
+#
+# Verified with streamlit 1.64.0 on Python 3.14.0.
+
+-r requirements.txt
+
+streamlit>=1.40
