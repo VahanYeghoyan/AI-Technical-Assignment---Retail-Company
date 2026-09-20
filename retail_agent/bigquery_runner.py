@@ -409,7 +409,15 @@ class BigQueryRunner:
             self._breaker.check(time.monotonic())
             try:
                 job = self.client.query(sql, job_config=self._job_config(dry_run=False))
-                dataframe = job.result(timeout=self.timeout_s).to_dataframe()
+                # REST download, not the Storage API. google-cloud-bigquery-
+                # storage is deliberately not a dependency (it pulls in gRPC),
+                # and result sets here are row-capped well below the size where
+                # it would pay off. Saying so explicitly also stops the client
+                # from warning "BigQuery Storage module not found" on every
+                # query -- it checks this flag before attempting the import.
+                dataframe = job.result(timeout=self.timeout_s).to_dataframe(
+                    create_bqstorage_client=False,
+                )
             except Exception as err:  # noqa: BLE001
                 error = err if isinstance(err, QueryError) else _classify(err)
                 if not error.retryable:

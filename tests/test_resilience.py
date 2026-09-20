@@ -50,7 +50,7 @@ class FakeJob:
     def result(self, timeout=None):  # noqa: ARG002
         return self
 
-    def to_dataframe(self):
+    def to_dataframe(self, create_bqstorage_client=None):  # noqa: ARG002
         return self._dataframe
 
 
