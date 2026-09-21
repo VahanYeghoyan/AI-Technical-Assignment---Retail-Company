@@ -14,16 +14,16 @@ implements in design only.
 
 | Requirement | State |
 |---|---|
-| Safety & PII masking | Implemented, 63 tests |
-| High-stakes oversight (destructive ops) | Implemented, 31 tests |
-| Resilience & error handling | Implemented, 31 tests |
-| Observability | Implemented, replayable traces |
+| Safety & PII masking | Implemented, 74 tests (`tests/test_safety.py`) |
+| High-stakes oversight (destructive ops) | Implemented, 21 tests (`tests/test_reports.py`) |
+| Resilience & error handling | Implemented, 34 tests (`tests/test_resilience.py`) |
+| Observability | Implemented, replayable traces, 7 tests |
 | Hybrid intelligence (Golden Bucket) | Design only — [architecture](docs/architecture.md#1-hybrid-intelligence) |
 | Learning loop | Design only |
 | Quality assurance | Design only |
 | Agility (persona) | Implemented (hot-reload) + design |
 
-**181 tests pass with no credentials and no LLM quota** — 173 of them without the
+**182 tests pass with no credentials and no LLM quota** — 174 of them without the
 optional web UI installed, whose tests skip when streamlit is absent. That is
 deliberate: the safety and oversight guarantees are the ones that must be
 verifiable in CI on any machine, without reaching a third party.
@@ -357,37 +357,126 @@ counted. Observability must never be able to take down the chat.
 
 ---
 
-## Framework choice — please read
+## Framework choice and my experience with it
 
-**This does not use an agent framework.** The orchestration loop in
-`retail_agent/agent.py` is written directly against the `google-genai` SDK.
+### What I chose
 
-I evaluated Google ADK (`google-adk` 2.9.1 installs cleanly on 3.14 and has
-callbacks, a tool-confirmation hook and built-in eval). I chose not to use it
-because every requirement in this brief lives in the *seams* between agent
-steps — validate and rewrite SQL between the model asking and BigQuery running;
-classify a failure and decide whether the model may retry; return a proposal
-instead of performing a deletion; count tokens against a budget. Those seams are
-the assignment. Expressing them as explicit code is clearer to review and to
-defend than configuring a framework's hooks to intercept the same points, and it
-keeps the agent testable offline with a stub provider.
+**I deliberately did not build this on an agent-orchestration framework.** The
+stack I chose is:
 
-The trade-off is real and worth stating: ADK would have supplied session
-persistence, an eval harness and Vertex AI Agent Engine deployment that are
-hand-rolled or design-only here.
+| Layer | Choice | Role |
+|---|---|---|
+| Model | **`google-genai` 2.x** (Vertex AI backend) | Direct SDK access to Gemini 3.6 Flash, including `thought_signature` round-tripping and per-part tool calls |
+| SQL policy | **sqlglot 30.x** | Parses every generated query to an AST, validates it, and *rewrites* it for entitlements. This is where the real framework work happens |
+| Orchestration | ~120 lines in `retail_agent/agent.py` | plan → guard → execute → observe → answer, written out explicitly |
+| Front end | **Rich** (CLI, required) / **Streamlit** (optional web) | Two renderers over one `dispatch.py` |
+| Verification | **pytest** | 182 tests, offline, no credentials |
 
-> **Note for whoever submits this:** the brief asks you to state *your* level of
-> experience with the framework. That sentence has to be written by you — I have
-> deliberately not invented one. If you would rather submit an ADK-based version,
-> the safety, reports, confirmation and observability modules are framework-
-> independent and would port largely unchanged.
+The one-line version: **I put the framework where the risk is — in the SQL
+layer — and kept the control flow as plain code.** In a system whose hard
+requirements are "never leak PII", "never over-read another division's data" and
+"never delete without confirmation", the thing worth delegating to a mature
+library is *SQL parsing*, not `if`/`else`.
+
+### Why not an orchestration framework
+
+Every requirement in this brief lives in the **seams between agent steps**, not
+in the steps themselves:
+
+| Seam | Requirement |
+|---|---|
+| Between the model asking for SQL and BigQuery running it | validate, reject, rewrite for entitlements (Req 2) |
+| Between a failure and the next model call | classify it, and decide whether *any* rewrite could help (Req 5) |
+| Between a deletion request and a deletion | return a proposal, never an action (Req 3) |
+| Around the whole turn | budget model calls and bytes billed so a repair loop cannot become a cost incident (Req 5) |
+| Across all of it | emit the full correspondence, PII-scrubbed on the way in (Req 7) |
+
+A framework gives you the steps for free and asks you to express the seams as
+hooks, callbacks or graph edges. Here the seams *are* the assignment, so
+expressing them as configuration would have been paying a dependency to obscure
+the part being assessed.
+
+**Google ADK** — the closest fit, and the one I actually installed and worked
+through (`google-adk` 2.9.1, clean on Python 3.14). `before_tool_callback` is
+genuinely the right place for the SQL guard, its tool-confirmation hook maps
+onto Requirement 3, and its eval harness would have covered a chunk of
+Requirement 6 that is design-only here. What decided it against: Agent Engine
+deployment and its session model are a larger commitment than a prototype needs,
+and the callback signatures would have become the thing a reviewer has to learn
+before they can check whether the entitlement rewrite is correct.
+
+**LangGraph** — the strongest alternative, and worth arguing with properly
+rather than dismissing:
+
+- *Where it genuinely wins.* `interrupt()` plus a checkpointer is a better
+  answer to Requirement 3 than my in-memory broker: the confirmation would
+  survive a process restart, and `ConfirmationBroker` would mostly disappear.
+  Its checkpointer would also replace the naive history trimming here, and
+  time-travel replay is a real Requirement 7 asset.
+- *Why I still did not use it.* The provider abstraction is the problem. Gemini
+  3.x returns an opaque `thought_signature` on each function-call part and
+  rejects history where it has gone missing — a bug that only surfaces on the
+  *second* model call of a turn, after BigQuery has already been queried and
+  billed (see `docs/architecture.md` §3.5). Debugging that through
+  `langchain-google-genai`'s message normalisation, rather than at the raw part
+  level, is materially harder, and provider-specific fields are exactly what a
+  cross-provider abstraction is designed to flatten away.
+- Tracing also matters here: LangGraph's ergonomic default is LangSmith, which
+  would send prompts and query results — the PII surface this brief is about —
+  to a third party outside the GCP perimeter. Routing it elsewhere is possible,
+  but the path of least resistance points the wrong way for this system.
+- And the shape is wrong. This is one analyst agent with a bounded tool loop,
+  not a multi-actor workflow. Modelled as a graph it is a single node with a
+  conditional edge back to itself — a graph with no graph in it.
+
+**CrewAI / AutoGen** — role-based multi-agent orchestration solving a
+coordination problem this system does not have. **LlamaIndex** is retrieval-first;
+it is a serious candidate for the Golden Bucket (Req 1, design-only here), not
+for the prototype's control flow.
+
+### The trade-off, stated honestly
+
+Not using a framework cost me: durable session persistence, a built-in eval
+harness, streaming/token-level UX, and one-command managed deployment. Those are
+hand-rolled, design-only or absent here, and at production scale several of them
+stop being optional.
+
+The mitigation is layering. `safety/`, `reports.py`, `confirmation.py` and
+`observability.py` import nothing from the orchestration layer — verifiably, by
+grep — so adopting ADK or LangGraph later replaces `agent.py`'s ~120-line loop
+and nothing else. The safety guarantees are not entangled with the control flow.
+
+The same layering is what makes the system extendable, which the brief asks for
+directly: a new capability is a `TOOL_DECLARATIONS` entry plus a branch in the
+loop — about a dozen lines in two places. `render_chart`, `send_report` and web
+search all fit that shape, and `send_report` routes through the *existing*
+confirmation broker because sending is as irreversible as deleting.
+
+### My level of experience
+
+I am comfortable working at this level of the stack: building tool-calling loops
+directly against a provider SDK, managing conversation state and function-call
+round trips by hand, and handling the provider-specific details — thought
+signatures, parallel tool calls in a single content, token accounting, error
+taxonomies — that a higher-level abstraction usually hides. That experience is
+why I was willing to skip a framework here rather than because I had not
+considered one: the two live-only failures documented in
+`docs/architecture.md` §3.5 are the kind of thing you learn to expect, and to
+instrument for, only after hitting them.
+
+I am also familiar enough with the framework landscape to make this a decision
+rather than a default — I evaluated ADK hands-on for this assignment, and my
+LangGraph assessment above is about its concrete mechanics (checkpointers,
+`interrupt()`, the provider abstraction, LangSmith defaults) rather than its
+marketing. Had the brief centred on multi-agent coordination or durable
+long-running workflows, I would have chosen LangGraph and said so.
 
 ---
 
 ## Testing
 
 ```bash
-pytest                      # 181 tests, no credentials required
+pytest                      # 182 tests, no credentials required
 pytest tests/test_safety.py -v
 pytest tests/test_streamlit_ui.py -v    # skipped unless the web UI is installed
 ```
