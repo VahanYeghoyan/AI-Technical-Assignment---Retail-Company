@@ -18,6 +18,7 @@ from retail_agent.bigquery_runner import (
     QueryError,
     QueryErrorKind,
 )
+from retail_agent.gcp import resolve_project
 from retail_agent.llm import (
     FunctionCall,
     GeminiProvider,
@@ -46,12 +47,25 @@ class FakeJob:
     def __init__(self, dataframe: pd.DataFrame, total_bytes_processed: int = 1000):
         self._dataframe = dataframe
         self.total_bytes_processed = total_bytes_processed
+        self.max_results_requested = "never called"
 
-    def result(self, timeout=None):  # noqa: ARG002
-        return self
+    def result(self, timeout=None, max_results=None):  # noqa: ARG002
+        self.max_results_requested = max_results
+        return FakeRows(self._dataframe, max_results)
+
+
+class FakeRows:
+    """A RowIterator: fetches at most max_results, but knows the full count."""
+
+    def __init__(self, dataframe: pd.DataFrame, max_results: int | None):
+        self._dataframe = dataframe
+        self._max_results = max_results
+        self.total_rows = len(dataframe)
 
     def to_dataframe(self, create_bqstorage_client=None):  # noqa: ARG002
-        return self._dataframe
+        if self._max_results is None:
+            return self._dataframe
+        return self._dataframe.head(self._max_results)
 
 
 class FakeBQClient:
@@ -87,7 +101,8 @@ class FakeBQClient:
             behaviour = self.behaviours.pop(0)
             if isinstance(behaviour, Exception):
                 raise behaviour
-        return FakeJob(self.dataframe)
+        self.last_job = FakeJob(self.dataframe)
+        return self.last_job
 
 
 def runner(client, **kwargs):
@@ -257,7 +272,7 @@ def test_a_timed_out_job_is_cancelled_before_the_retry():
             self.job_id = "job-1"
             self.total_bytes_processed = 10
 
-        def result(self, timeout=None):  # noqa: ARG002
+        def result(self, timeout=None, max_results=None):  # noqa: ARG002
             raise TimeoutError("job still running")
 
         def cancel(self):
@@ -341,6 +356,25 @@ def test_guard_rejection_surfaces_as_a_self_correctable_error():
     assert client.queries == []  # never reached BigQuery
 
 
+@pytest.mark.parametrize(
+    ("sql", "is_refusal"),
+    [
+        ("SELECT email FROM users", True),                       # PII
+        ("SELECT TO_JSON_STRING(u) AS j FROM users u", True),    # whole row
+        ("DELETE FROM orders WHERE order_id = 1", True),         # a write
+        ("SELECT CURRENT_DATE() AS today", False),               # no table: a fumble
+        ("SELECT FROM WHERE", False),                            # syntax
+    ],
+)
+def test_only_policy_rejections_count_as_refusals(sql, is_refusal):
+    tracer = Tracer(user_id="ceo", conversation_id="c1")
+    with pytest.raises(QueryError):
+        runner(FakeBQClient()).execute(sql, UNRESTRICTED, tracer=tracer)
+
+    assert tracer.metrics.sql_rejections == 1
+    assert tracer.metrics.refusals == (1 if is_refusal else 0)
+
+
 def test_scope_is_applied_and_audited():
     client = FakeBQClient()
     tracer = Tracer(user_id="maya", conversation_id="c1")
@@ -370,6 +404,18 @@ def test_large_result_sets_are_truncated():
     assert result.truncated is True
     assert len(result.dataframe) == 50
     assert result.row_count == 500  # the true count is still reported honestly
+    # ...and only the capped rows were downloaded, not all 500.
+    assert client.last_job.max_results_requested == 50
+
+
+def test_the_compatibility_api_still_returns_every_row():
+    # execute_query() is the supplied runner's interface: callers expect the
+    # whole result, so the agent's row cap must not leak into it.
+    client = FakeBQClient(dataframe=pd.DataFrame({"n": range(500)}))
+    frame = runner(client, max_rows=50).execute_query(SIMPLE_SQL)
+
+    assert len(frame) == 500
+    assert client.last_job.max_results_requested is None
 
 
 def test_results_render_even_without_the_optional_tabulate_package(monkeypatch):
@@ -618,6 +664,71 @@ def test_missing_api_key_is_a_clear_config_error(monkeypatch):
     with pytest.raises(LLMConfigError) as err:
         GeminiProvider()
     assert "LLM_PROVIDER=stub" in str(err.value)
+
+
+class _Credentials:
+    def __init__(self, quota_project_id=None):
+        self.quota_project_id = quota_project_id
+
+
+def _adc(monkeypatch, *, project=None, quota_project=None):
+    """Application Default Credentials that resolve as given, with no env override."""
+    import google.auth
+
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setattr(
+        google.auth, "default", lambda: (_Credentials(quota_project), project)
+    )
+
+
+def test_vertex_uses_the_gcloud_project_when_none_is_configured(monkeypatch):
+    # A reviewer who ran `gcloud config set project` must not also have to
+    # repeat it in .env — and must never inherit someone else's project from it.
+    import google.genai
+
+    _adc(monkeypatch, project="reviewer-project")
+    seen = {}
+    monkeypatch.setattr(google.genai, "Client", lambda **kwargs: seen.update(kwargs))
+
+    provider = GeminiProvider(use_vertex=True)
+
+    assert provider.project == "reviewer-project"
+    assert seen["project"] == "reviewer-project" and seen["vertexai"] is True
+
+
+def test_the_project_falls_back_to_the_credentials_quota_project(monkeypatch):
+    # google.auth asks the gcloud binary for the configured project, so with
+    # gcloud off PATH it finds none — though the credentials file names one.
+    _adc(monkeypatch, project=None, quota_project="quota-project")
+
+    assert resolve_project() == "quota-project"
+
+
+def test_an_explicit_project_wins(monkeypatch):
+    _adc(monkeypatch, project="gcloud-project")
+    assert resolve_project("explicit") == "explicit"
+
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "from-env")
+    assert resolve_project() == "from-env"
+
+
+def test_bigquery_resolves_the_same_project_vertex_does(monkeypatch):
+    from google.cloud import bigquery
+
+    _adc(monkeypatch, project=None, quota_project="quota-project")
+    seen = {}
+    monkeypatch.setattr(bigquery, "Client", lambda project=None: seen.update(project=project))
+
+    BigQueryRunner().client  # noqa: B018 - building the client is the point
+
+    assert seen["project"] == "quota-project"
+
+
+def test_vertex_with_no_project_anywhere_says_how_to_set_one(monkeypatch):
+    _adc(monkeypatch, project=None, quota_project=None)
+    with pytest.raises(LLMConfigError) as err:
+        GeminiProvider(use_vertex=True)
+    assert "gcloud config set project" in str(err.value)
 
 
 def test_stub_provider_runs_without_network():

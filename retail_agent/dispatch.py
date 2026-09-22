@@ -53,6 +53,7 @@ class Kind(StrEnum):
 
     EMPTY = "empty"
     DELETED = "deleted"
+    REPROMPT = "reprompt"
     CANCELLED = "cancelled"
     QUIT = "quit"
     HELP = "help"
@@ -117,6 +118,14 @@ def dispatch(
         )
         agent.last_deleted = tuple(r.report_id for r in deleted.deleted)
         return [Outcome(Kind.DELETED, delete_outcome=deleted)]
+
+    if verdict == "reprompt":
+        # Still pending: the reply meant yes, but not in the form a bulk
+        # delete requires. Nothing is deleted and nothing reaches the model.
+        # (If it expired a moment ago, the reply is an ordinary message.)
+        pending = agent.broker.pending_for(agent.scope.user_id)
+        if pending is not None:
+            return [Outcome(Kind.REPROMPT, text=pending.reprompt())]
 
     if verdict == "cancel":
         cancelled = agent.broker.cancel(agent.scope.user_id)

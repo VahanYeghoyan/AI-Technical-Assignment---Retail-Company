@@ -80,10 +80,22 @@ class SqlGuardError(ValueError):
     loop; `message` is what the model is shown so it can fix its query.
     """
 
+    # The policy saying no, as opposed to a query that is merely malformed
+    # (syntax_error, empty_query, no_tables). Counted as refusals: a model
+    # fumbling SQL and someone probing for customer data are different alerts.
+    POLICY_REASONS = frozenset({
+        "not_read_only", "multiple_statements", "table_not_allowed",
+        "cte_shadows_table", "pii_column", "star_over_users", "row_reference",
+    })
+
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
         self.message = message
+
+    @property
+    def is_policy(self) -> bool:
+        return self.reason in self.POLICY_REASONS
 
 
 @dataclass(frozen=True)
@@ -303,21 +315,29 @@ def _check_pii(tree: exp.Expression, tables: frozenset[str]) -> None:
         )
 
 
-def _direct_sources(select: exp.Select) -> list[exp.Expression]:
-    """The FROM and JOIN targets of THIS select — not of its subqueries.
+def _own_base_tables(select: exp.Select) -> list[exp.Table]:
+    """The tables THIS select reads directly — not those of its subqueries.
 
-    Found by scanning for From/Join nodes rather than by argument name, because
-    sqlglot keys the FROM clause as "from_" in 30.x and as "from" in earlier
-    releases. Reading the wrong key returns None and the caller's check then
-    passes everything, in silence — a way for a safety rule to stop working
-    that no test of valid queries would ever notice.
+    Every Table under the SELECT whose nearest enclosing SELECT is this one.
+    That covers FROM and JOIN targets, and also a parenthesised join:
+
+        SELECT TO_JSON_STRING(u) FROM (users AS u JOIN orders o ON ...)
+
+    which sqlglot parses as a Subquery wrapping a Table rather than as a plain
+    source. Reading only the direct FROM and JOIN children missed that shape,
+    and BigQuery accepts the query — it returned every users column, names and
+    postcodes included, for scoped and unrestricted users alike. A table inside
+    a real subquery belongs to that subquery's SELECT and is checked there.
+
+    Walking by ancestry also avoids reading the FROM clause by argument name,
+    which sqlglot keys as "from_" in 30.x and "from" before — reading the wrong
+    key returns None and the check passes everything, silently.
     """
-    sources: list[exp.Expression] = []
-    for value in select.args.values():
-        for item in value if isinstance(value, list) else [value]:
-            if isinstance(item, (exp.From, exp.Join)):
-                sources.append(item.this)
-    return sources
+    return [
+        table
+        for table in select.find_all(exp.Table)
+        if table.find_ancestor(exp.Select) is select
+    ]
 
 
 def _check_row_references(tree: exp.Expression, cte_names: frozenset[str]) -> None:
@@ -343,11 +363,10 @@ def _check_row_references(tree: exp.Expression, cte_names: frozenset[str]) -> No
     query (`SELECT COUNT(*) AS orders ...`) from being mistaken for a row.
     """
     for select in tree.find_all(exp.Select):
-        sources = _direct_sources(select)
         aliases = {
             (table.alias or table.name).lower()
-            for table in sources
-            if isinstance(table, exp.Table) and not _is_cte_reference(table, cte_names)
+            for table in _own_base_tables(select)
+            if not _is_cte_reference(table, cte_names)
         }
         if not aliases:
             continue

@@ -218,16 +218,44 @@ def test_a_real_cte_reference_still_works():
         "WHERE STRPOS(TO_JSON_STRING(u), 'alice@example.com') > 0",
         # No alias: the table's own name is the row.
         "SELECT TO_JSON_STRING(users) AS j FROM users",
+        # A parenthesised join is parsed as a Subquery wrapping the tables, not
+        # as plain FROM/JOIN sources. BigQuery accepts it, and this shape once
+        # returned first/last names and postcodes that no other rule saw.
+        "SELECT TO_JSON_STRING(u) AS j "
+        "FROM (users AS u JOIN orders AS o ON o.user_id = u.id)",
+        # ...and nested one level down, in the JOIN position.
+        "SELECT TO_JSON_STRING(u) AS j FROM order_items AS oi "
+        "JOIN (users AS u JOIN orders AS o ON o.user_id = u.id) "
+        "ON oi.order_id = o.order_id",
     ],
 )
 def test_whole_row_references_are_rejected(sql):
     assert reason(sql) == "row_reference"
 
 
-def test_row_reference_check_survives_scoping():
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT TO_JSON_STRING(u) AS j FROM users u",
+        "SELECT TO_JSON_STRING(u) AS j "
+        "FROM (users AS u JOIN orders AS o ON o.user_id = u.id)",
+    ],
+)
+def test_row_reference_check_survives_scoping(sql):
     # Restricted users get the same answer as unrestricted ones: the rewrite
     # happens after validation, so it cannot be used to sneak one past.
-    assert reason("SELECT TO_JSON_STRING(u) AS j FROM users u", WOMENS) == "row_reference"
+    assert reason(sql, WOMENS) == "row_reference"
+
+
+def test_a_parenthesised_join_of_named_columns_is_allowed_and_scoped():
+    sql = (
+        "SELECT u.state, COUNT(*) AS n "
+        "FROM (users AS u JOIN orders AS o ON o.user_id = u.id) GROUP BY u.state"
+    )
+    result = guard(sql, WOMENS)
+    assert result.tables == frozenset({"users", "orders"})
+    assert result.rewritten is True
+    assert "department IN ('Women')" in result.sql
 
 
 def test_a_column_sharing_a_table_name_is_not_a_row_reference():

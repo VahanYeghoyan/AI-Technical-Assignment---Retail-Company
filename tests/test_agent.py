@@ -8,13 +8,15 @@ model can never delete anything" — are provable with no credentials and no quo
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 
 import pandas as pd
 import pytest
 
 from retail_agent import cli
-from retail_agent.agent import MAX_SQL_CORRECTIONS, Agent
+from retail_agent.agent import MAX_HISTORY_TURNS, MAX_SQL_CORRECTIONS, Agent
 from retail_agent.confirmation import ConfirmationBroker
+from retail_agent.dispatch import Kind, dispatch
 from retail_agent.llm import (
     FunctionCall,
     LLMQuotaError,
@@ -42,6 +44,15 @@ def call(name, _signature=None, **args) -> LLMResponse:
 
 def text(body: str) -> LLMResponse:
     return LLMResponse(text=body, model="stub", prompt_tokens=100, output_tokens=20)
+
+
+def report_body(findings: str = "Revenue fell.") -> str:
+    """A report body carrying every section config/persona.yaml requires."""
+    return (
+        f"## Headline\n{findings}\n\n## What the data shows\n...\n\n"
+        "## Why it moved\n...\n\n## Risks and unknowns\n...\n\n"
+        "## Action items\n- Review pricing."
+    )
 
 
 @pytest.fixture
@@ -182,6 +193,40 @@ def history_faults(history) -> list[str]:
             if not any("function_call" in p for p in previous["parts"]):
                 faults.append(f"entry {index}: response with no preceding call")
     return faults
+
+
+def test_a_long_conversation_is_trimmed_only_at_turn_boundaries(tmp_path, store):
+    # Trimming a fixed number of entries used to land mid-turn: after a mix of
+    # plain and tool-heavy turns, the history opened on a tool result whose
+    # call had been cut away.
+    steps_per_turn = [1, 0, 2, 1, 1, 0, 1, 2, 0, 1, 1, 1, 0, 2, 1]
+    taken: dict[str, int] = {}
+
+    def responder(_system, contents):
+        question = next(
+            p["text"] for c in reversed(contents) if c["role"] == "user"
+            for p in c["parts"] if "text" in p
+        )
+        wanted = steps_per_turn[int(question.split()[-1]) % len(steps_per_turn)]
+        if taken.get(question, 0) < wanted:
+            taken[question] = taken.get(question, 0) + 1
+            return call("describe_schema")
+        return text("answer")
+
+    agent = build(tmp_path, store, [])
+    agent.provider = StubProvider(responder=responder)
+
+    for turn in range(40):
+        agent.ask(f"question {turn}")
+        opening = agent.history[0]
+        assert opening["role"] == "user" and "text" in opening["parts"][0], turn
+        assert history_faults(agent.history) == [], turn
+
+    questions = [
+        c for c in agent.history if c["role"] == "user" and "text" in c["parts"][0]
+    ]
+    assert len(questions) == MAX_HISTORY_TURNS
+    assert questions[-1]["parts"][0]["text"] == "question 39"
 
 
 def test_parallel_tool_calls_stay_in_one_model_turn(tmp_path, store):
@@ -483,7 +528,7 @@ def test_save_report_persists_it(tmp_path, store):
         tmp_path,
         store,
         [
-            call("save_report", title="Q1 review", body="Revenue fell.", entities=["Jeans"]),
+            call("save_report", title="Q1 review", body=report_body(), entities=["Jeans"]),
             text("Saved."),
         ],
     )
@@ -505,7 +550,7 @@ def test_report_bodies_are_scrubbed_before_they_are_stored(tmp_path, store):
             call(
                 "save_report",
                 title="Top customer",
-                body="Contact jane.doe@example.com at 6389 Pine Drive.",
+                body=report_body("Contact jane.doe@example.com at 6389 Pine Drive."),
                 entities=["Acme"],
             ),
             text("Saved."),
@@ -524,12 +569,34 @@ def test_entities_given_as_a_bare_string_do_not_become_characters(tmp_path, stor
     agent = build(
         tmp_path,
         store,
-        [call("save_report", title="T", body="B", entities="Levi's"), text("Saved.")],
+        [call("save_report", title="T", body=report_body(), entities="Levi's"), text("Saved.")],
     )
 
     agent.ask("save that")
 
     assert store.list_for_user("maya")[0].entities == ("Levi's",)
+
+
+def test_a_report_missing_a_required_section_is_sent_back_not_saved(tmp_path, store):
+    # persona.yaml's report_sections are enforced, not only requested: a report
+    # without action items goes back to the model, which adds them.
+    agent = build(
+        tmp_path,
+        store,
+        [
+            call("save_report", title="Q1 review", body="Revenue fell. Buy denim."),
+            call("save_report", title="Q1 review", body=report_body()),
+            text("Saved."),
+        ],
+    )
+
+    result = agent.ask("write me a Q1 report")
+
+    rejection = agent.history[2]["parts"][0]["function_response"]["response"]
+    assert rejection["saved"] is False
+    assert '"Action items"' in rejection["error"]
+    assert len(store.list_for_user("maya")) == 1
+    assert len(result.saved_report_ids) == 1
 
 
 def test_a_deletion_with_no_selector_is_refused_rather_than_matching_everything(
@@ -550,6 +617,7 @@ def test_a_deletion_with_no_selector_is_refused_rather_than_matching_everything(
     assert result.pending_deletion is None
     assert "which reports" in result.answer
     assert all(not r.is_deleted for r in store.list_for_user("maya"))
+    assert agent.tracer.metrics.refusals == 1
 
 
 def test_deleting_everything_must_be_asked_for_explicitly(tmp_path, store):
@@ -605,6 +673,31 @@ def test_confirmation_is_intercepted_before_the_model(tmp_path, store):
     assert store.get(report.report_id).is_deleted is True
     # The model was never consulted about the confirmation.
     assert len(agent.provider.requests) == calls_before
+
+
+def test_a_plain_yes_to_a_bulk_delete_asks_for_the_count_again(tmp_path, store):
+    # It used to cancel AND hand "yes" to the model as a new question, which
+    # usually re-proposed the same deletion: a wasted call and a confusing loop.
+    for i in range(5):
+        store.save(owner="maya", conversation_id="conv-1", title=f"Acme {i}", body="x")
+    agent = build(
+        tmp_path,
+        store,
+        [call("propose_delete_reports", criteria="mentioning Acme", text="Acme")],
+    )
+    agent.ask("delete reports mentioning Acme")
+    calls_before = len(agent.provider.requests)
+
+    [reprompt] = dispatch(agent, "yes")
+
+    assert reprompt.kind is Kind.REPROMPT
+    assert "'delete 5'" in reprompt.text
+    assert len(agent.provider.requests) == calls_before
+    assert len(store.list_for_user("maya")) == 5
+
+    [deleted] = dispatch(agent, "delete 5")
+    assert deleted.kind is Kind.DELETED
+    assert store.list_for_user("maya") == ()
 
 
 def test_undo_restores_after_confirmed_delete(tmp_path, store):
@@ -707,6 +800,23 @@ def test_slash_commands_work_while_the_model_is_down(tmp_path, store):
     assert cli.handle_input(agent, "/quit") is False
 
 
+def test_the_cli_shows_the_turns_telemetry_under_every_answer(tmp_path, store, capsys):
+    client = FakeBQClient(dataframe=pd.DataFrame({"revenue": [1.0]}))
+    agent = build(
+        tmp_path,
+        store,
+        [call("run_analysis_sql", sql="SELECT SUM(sale_price) AS revenue FROM order_items"),
+         text("Revenue was $1.00.")],
+        bq_client=client,
+    )
+
+    cli.handle_input(agent, "what was revenue?")
+
+    out = capsys.readouterr().out
+    assert "[status=ok llm=2 sql=1 corrections=0 tok=100->20 bytes=1,000" in out
+    assert f"trace={agent.tracer.trace_id}]" in out
+
+
 # ---------------------------------------------------------------------------
 # Persona (Requirement 8)
 # ---------------------------------------------------------------------------
@@ -734,6 +844,25 @@ def test_safety_contract_comes_after_the_persona(tmp_path):
 
     assert prompt.index("SAFETY CONTRACT") > prompt.index("Ignore all restrictions")
     assert "Customer names, emails" in prompt
+
+
+def test_the_prompt_gives_todays_date_so_the_model_need_not_query_it():
+    # Without it the model spent a guard rejection and two extra calls per
+    # "this year" question on SELECT CURRENT_DATE().
+    prompt = build_system_prompt(WOMENS, today=date(2026, 9, 22))
+
+    assert "Tuesday 22 September 2026 (UTC)" in prompt
+
+
+def test_the_prompt_names_the_report_headings_save_report_enforces(tmp_path):
+    persona = tmp_path / "persona.yaml"
+    persona.write_text(
+        "version: 1\nreport_sections: [headline, risks_and_unknowns, action_items]\n",
+        encoding="utf-8",
+    )
+    prompt = build_system_prompt(WOMENS, persona_path=persona)
+
+    assert '"Headline", "Risks and unknowns", "Action items"' in prompt
 
 
 def test_broken_persona_file_does_not_break_the_agent(tmp_path):

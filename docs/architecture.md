@@ -41,7 +41,7 @@ flowchart TB
         BQ[("BigQuery<br/>thelook_ecommerce<br/><b>authorized views</b>")]
         GCS[("GCS<br/>golden trios<br/>report exports")]
         FS[("Firestore<br/>reports · sessions<br/>preferences · persona")]
-        SEC["Secret Manager<br/>API keys"]
+        SEC["Secret Manager<br/>third-party tool keys"]
     end
 
     subgraph ops["Observability"]
@@ -68,7 +68,7 @@ flowchart TB
     TOOLS --> FS
     TOOLS --> GCS
     ORCH -.reads.-> FS
-    GEM -.key.-> SEC
+    TOOLS -.email / web keys.-> SEC
 
     ORCH -.spans.-> TRACE
     ORCH -.events.-> LOG
@@ -93,7 +93,7 @@ flowchart TB
 | Access control | **Authorized views + row-level access policies** | Moves entitlements *into* the database. The agent then cannot over-read even if the application layer is compromised. |
 | Golden Bucket | **GCS** (trios) + **Vertex AI Vector Search** (index) | Trios are documents; retrieval is nearest-neighbour. Vector Search handles scale and filtered queries; for <100k trios, BigQuery `VECTOR_SEARCH` is the cheaper option and avoids a service. |
 | Operational state | **Firestore** | Reports, sessions, preferences and persona are per-user documents with simple queries; TTL policies expire soft-deleted reports without a cron job. |
-| Secrets | **Secret Manager** | Keys never in env files or images; rotation without redeploy. |
+| Secrets | **Secret Manager** | Only for what IAM cannot cover — the email provider and web-search API keys of future tools; Gemini and BigQuery need no key at all under Vertex. Never in env files or images; rotation without redeploy. |
 | Telemetry | **Cloud Trace + Logging → BigQuery** | Traces for one-turn debugging, a BigQuery log sink for aggregate analysis and eval mining. |
 
 ---
@@ -107,8 +107,10 @@ flowchart TB
 3. **Retrieve.** The question is embedded and the Golden Bucket returns the 3–5
    nearest analyst trios *whose scope the user is entitled to see* — so retrieval
    itself cannot leak another division's analysis.
-4. **Assemble the prompt.** Role → schema + metric glossary → retrieved trios →
-   persona → user preferences → **safety contract last** (see §3.8).
+4. **Assemble the prompt.** Role → today's date, schema + metric glossary →
+   retrieved trios → user preferences → persona → **safety contract last**
+   (see §3.8). Later layers take precedence, so preferences shape format, the
+   persona sets tone, and neither can outrank the safety contract.
 5. **Plan.** Gemini responds with prose or a tool call.
 6. **Guard.** For `run_analysis_sql`: parse, validate, rewrite for entitlements.
    A rejection returns a model-readable reason rather than an exception.
@@ -193,12 +195,23 @@ Implemented — see the README for the enforced rules. Production additions:
   of one cannot be reconstructed by narrowing filters.
 - **Separate egress review** for the future email tool — the moment reports can
   be mailed out, PII masking becomes an exfiltration control, not a display one.
+- **Pseudonymise in the view, not by column name.** The prototype replaces raw
+  customer ids with `CUST-` handles by result column name (`user_id`,
+  `customer_id`), and the prompt tells the model to use those names; a query
+  that aliases `users.id` as anything else returns the raw id. Raw ids are
+  surrogate keys rather than personal data, but the authorized views should
+  expose only the pseudonym so no alias can reach the original.
+- **Order-level fields in a scoped view.** A scoped user sees every order that
+  contains one of their products, and `orders.num_of_item` counts all of that
+  order's items, in scope or not. The authorized view should recompute it over
+  in-scope items only.
 
 ### 3.3 High-stakes oversight
 
 Implemented. The design point worth restating: strictness is proportional to
 blast radius, and **soft deletion is what makes a friendly confirmation tier
-defensible**. In production, deletions of 25+ reports additionally require a
+defensible**. Above three reports a bare "yes" is answered with the count to
+type rather than taken, and the proposal stays open. In production, deletions of 25+ reports additionally require a
 second approver, and Firestore TTL purges soft-deleted rows after 30 days.
 
 ### 3.4 Continuous improvement
@@ -226,9 +239,9 @@ how an agent silently drifts out of compliance.
 ### 3.5 Resilience
 
 Implemented — classification table in the README. In production additionally:
-regional Cloud Run failover, a Gemini→Vertex AI endpoint fallback for provider-
-level outages, request hedging on p99 latency, and idempotency keys so a retried
-report-save cannot duplicate.
+regional Cloud Run failover, a fallback from the `global` Vertex AI endpoint to
+a regional one for provider-level outages, request hedging on p99 latency, and
+idempotency keys so a retried report-save cannot duplicate.
 
 **Two failure modes worth recording, because both were invisible to a fully
 green test suite and only appeared against live services.**
@@ -246,12 +259,15 @@ conversation format needs a contract test against the real API.
 *Not every 4xx deserves a retry.* Both dependencies produced a 400 that was
 initially classified as retryable or self-correctable — BigQuery's malformed job
 configuration, and the missing signature above. Each would have spent the turn's
-entire budget re-sending a request that could never succeed. The rule adopted
-throughout: **a 400 means our request is wrong, so it is fatal — never retried,
-never sent to a fallback model, never handed to the LLM as "fix your SQL".**
-Retries are reserved for 5xx, timeouts and rate limits. Misclassifying here is
-how a self-correction loop quietly becomes a cost incident, which is the exact
-failure Requirement 5 warns about.
+entire budget re-sending a request that could never succeed. The rule adopted:
+**a 400 that is about our request rather than the model's SQL is fatal** — a
+400 from the model API, or a BigQuery job-configuration 400, is never retried,
+never sent to a fallback model, never handed to the LLM as "fix your SQL". The
+one 400 that *is* handed back is a BigQuery error in the SQL itself (a syntax
+error, an unknown column), because a rewrite can fix exactly that — bounded to
+3 repairs. Retries are reserved for 5xx, timeouts and rate limits.
+Misclassifying here is how a self-correction loop quietly becomes a cost
+incident, which is the exact failure Requirement 5 warns about.
 
 ### 3.6 Quality assurance
 
@@ -291,6 +307,7 @@ Implemented in prototype form. Metrics to alert on, at the agent level:
 | SQL first-attempt rate | prompt/schema drift | < 80% |
 | Self-correction depth | model degradation | mean > 1.5 |
 | Guard rejection rate | injection or prompt drift | spike over baseline |
+| Refusals (policy blocks: PII, whole-row, write, unselective delete) | someone probing, as distinct from the model fumbling SQL | any spike, per user |
 | PII redaction count at output | **should be ~0**; non-zero means a layer failed | any sustained non-zero |
 | p95 latency | UX | > 45 s |
 | Tokens & bytes billed per turn | cost | > 2× 7-day baseline |
@@ -360,6 +377,8 @@ New capabilities are tools; the orchestrator does not change.
   differently from BigQuery is the plausible bypass; authorized views are the
   real mitigation, which is why they are not optional in production.
 - k-anonymity is instructed but not yet enforced in SQL.
+- Customer-id pseudonymisation keys on the result column name, and
+  `orders.num_of_item` is not recomputed for scoped users (§3.2).
 - Conversation history is dropped rather than summarised past 12 turns.
 - Cost caps are per query, not per user per day; a budget ledger in Firestore is
   the natural next step.

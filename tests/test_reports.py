@@ -187,13 +187,25 @@ def test_bulk_delete_requires_typing_the_count(store, broker):
     assert pending.requires_count is True
     assert f"delete {n}" in pending.prompt()
 
-    # A reflexive "yes" must NOT delete five reports.
-    assert broker.interpret("maya", "yes") == "cancel"
+    # A reflexive "yes" must NOT delete five reports — it is asked for the
+    # count instead, with the proposal left open.
+    assert broker.interpret("maya", "yes") == "reprompt"
     # The wrong count must not either.
-    assert broker.interpret("maya", f"delete {n - 1}") == "cancel"
+    assert broker.interpret("maya", f"delete {n - 1}") == "reprompt"
+    assert f"'delete {n}'" in pending.reprompt()
+    assert broker.pending_for("maya") is not None
     assert broker.interpret("maya", f"delete {n}") == "confirm"
 
     assert broker.confirm("maya").deleted_count == n
+
+
+def test_anything_but_yes_or_a_count_still_cancels_a_bulk_delete(store, broker):
+    for i in range(BULK_THRESHOLD + 1):
+        make_report(store, title=f"Acme {i}")
+    broker.propose_deletion(actor="maya", criteria="mentioning Acme", text="Acme")
+
+    assert broker.interpret("maya", "no") == "cancel"
+    assert broker.interpret("maya", "show me Q2 revenue instead") == "cancel"
 
 
 def test_delete_scoped_to_this_conversation(store, broker):

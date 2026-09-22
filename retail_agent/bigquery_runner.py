@@ -41,6 +41,7 @@ from typing import Any, Callable
 import pandas as pd
 from google.api_core import exceptions as gexc
 
+from retail_agent.gcp import resolve_project
 from retail_agent.observability import Tracer
 from retail_agent.safety.pii import pseudonymize_customer_ids, scrub_dataframe
 from retail_agent.safety.scope import Scope
@@ -330,7 +331,9 @@ class BigQueryRunner:
             from google.cloud import bigquery
 
             try:
-                self._client = bigquery.Client(project=self.project_id)
+                # The same resolution Vertex uses, so jobs and model calls can
+                # never land in two different projects.
+                self._client = bigquery.Client(project=resolve_project(self.project_id))
             except Exception as err:  # noqa: BLE001
                 raise QueryError(
                     QueryErrorKind.PERMISSION,
@@ -354,6 +357,8 @@ class BigQueryRunner:
         except SqlGuardError as err:
             if tracer:
                 tracer.metrics.sql_rejections += 1
+                if err.is_policy:
+                    tracer.metrics.refusals += 1
                 tracer.audit(
                     "sql_rejected", reason=err.reason, message=err.message, sql=sql
                 )
@@ -380,7 +385,9 @@ class BigQueryRunner:
                 "than selecting detail rows.",
             )
 
-        dataframe, bytes_processed = self._run_with_retries(guarded.sql, tracer=tracer)
+        dataframe, bytes_processed, total_rows = self._run_with_retries(
+            guarded.sql, tracer=tracer, max_rows=self.max_rows
+        )
 
         cleaned, redactions = scrub_dataframe(dataframe)
         cleaned, pseudonymised = pseudonymize_customer_ids(cleaned)
@@ -390,14 +397,14 @@ class BigQueryRunner:
         if pseudonymised and tracer:
             tracer.audit("pseudonymised", where="query_result", columns=pseudonymised)
 
-        truncated = len(cleaned) > self.max_rows
-        if truncated:
-            cleaned = cleaned.head(self.max_rows)
+        cleaned = cleaned.head(self.max_rows)
+        row_count = max(total_rows, len(dataframe))
+        truncated = row_count > len(cleaned)
 
         result = QueryResult(
             sql=guarded.sql,
             dataframe=cleaned,
-            row_count=int(len(dataframe)),
+            row_count=row_count,
             bytes_processed=bytes_processed,
             truncated=truncated,
             redactions=tuple(redactions),
@@ -423,7 +430,7 @@ class BigQueryRunner:
         applies entitlements. Retained so existing scripts and notebooks that
         import this class keep working.
         """
-        dataframe, _ = self._run_with_retries(sql_query, tracer=None)
+        dataframe, _, _ = self._run_with_retries(sql_query, tracer=None, max_rows=None)
         return dataframe
 
     def get_table_schema(self, table_name: str) -> list[dict[str, Any]]:
@@ -529,23 +536,30 @@ class BigQueryRunner:
         raise last
 
     def _run_with_retries(
-        self, sql: str, *, tracer: Tracer | None
-    ) -> tuple[pd.DataFrame, int]:
+        self, sql: str, *, tracer: Tracer | None, max_rows: int | None
+    ) -> tuple[pd.DataFrame, int, int]:
+        """Run a query; returns (rows fetched, bytes processed, total row count).
+
+        Only `max_rows` rows are downloaded. The cap used to be applied after
+        the download, so a detail query pulled every row over REST — 180k
+        order_items rows for a 200-row answer — outside the query timeout,
+        which covers the job and not the download.
+        """
         last: QueryError | None = None
         for attempt in range(1, self.max_attempts + 1):
             self._breaker.check(time.monotonic())
             job = None
             try:
                 job = self.client.query(sql, job_config=self._job_config(dry_run=False))
+                rows = job.result(timeout=self.timeout_s, max_results=max_rows)
                 # REST download, not the Storage API. google-cloud-bigquery-
                 # storage is deliberately not a dependency (it pulls in gRPC),
                 # and result sets here are row-capped well below the size where
                 # it would pay off. Saying so explicitly also stops the client
                 # from warning "BigQuery Storage module not found" on every
                 # query -- it checks this flag before attempting the import.
-                dataframe = job.result(timeout=self.timeout_s).to_dataframe(
-                    create_bqstorage_client=False,
-                )
+                dataframe = rows.to_dataframe(create_bqstorage_client=False)
+                total_rows = int(getattr(rows, "total_rows", None) or len(dataframe))
             except Exception as err:  # noqa: BLE001
                 error = err if isinstance(err, QueryError) else _classify(err)
                 if error.kind is QueryErrorKind.TIMEOUT:
@@ -573,7 +587,7 @@ class BigQueryRunner:
             else:
                 self._breaker.reset()
                 bytes_processed = int(getattr(job, "total_bytes_processed", 0) or 0)
-                return dataframe, bytes_processed
+                return dataframe, bytes_processed, total_rows
 
         assert last is not None
         raise last

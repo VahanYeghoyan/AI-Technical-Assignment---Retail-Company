@@ -22,9 +22,17 @@ streamlit = pytest.importorskip(
     reason="optional web UI — pip install -r requirements-ui.txt",
 )
 
+from google.api_core import exceptions as gexc  # noqa: E402
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
+from retail_agent.bigquery_runner import BigQueryRunner  # noqa: E402
+
 APP = Path(__file__).resolve().parents[1] / "streamlit_app.py"
+
+
+class _NoWarehouse:
+    def query(self, *_args, **_kwargs):
+        raise gexc.Forbidden("no BigQuery credentials in the test suite")
 
 
 def _texts(elements) -> list[str]:
@@ -44,6 +52,10 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setenv("REPORTS_DB_PATH", str(tmp_path / "reports.db"))
     monkeypatch.setenv("TRACE_DIR", str(tmp_path / "traces"))
     monkeypatch.setenv("AGENT_USER", "maya")
+    # The offline demo answers a data question with a real query, so BigQuery
+    # is replaced by a warehouse that refuses — what a machine with no
+    # credentials sees — and the suite never touches the network.
+    monkeypatch.setattr(BigQueryRunner, "client", property(lambda _self: _NoWarehouse()))
 
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()

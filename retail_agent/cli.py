@@ -148,6 +148,24 @@ def _render_trace_turns(outcome: Outcome) -> None:
     console.print("[dim]/trace <id> for the full event stream of one turn.[/dim]")
 
 
+def telemetry_line(outcome: Outcome) -> str:
+    """The turn's counters in one line — the same figures the trace records.
+
+    Shown under every answer, not just failed ones: model calls, SQL attempts,
+    self-corrections, tokens and bytes billed are exactly what Requirement 7
+    asks to be visible, and a reviewer should not need /trace to see them.
+    """
+    result, metrics = outcome.result, outcome.metrics
+    assert result is not None
+    return (
+        f"[status={result.status} llm={metrics.get('llm_calls', 0)} "
+        f"sql={metrics.get('sql_attempts', 0)} "
+        f"corrections={metrics.get('sql_self_corrections', 0)} "
+        f"tok={metrics.get('prompt_tokens', 0)}->{metrics.get('output_tokens', 0)} "
+        f"bytes={metrics.get('bq_bytes_billed', 0):,} trace={result.trace_id}]"
+    )
+
+
 def _render_answer(outcome: Outcome) -> None:
     result = outcome.result
     assert result is not None
@@ -158,11 +176,13 @@ def _render_answer(outcome: Outcome) -> None:
             f"[green]Saved report {result.saved_report_ids[0][:8]}[/green] "
             "[dim](/reports to list)[/dim]"
         )
+    console.print()
+    # Escaped: the line is bracketed, and Rich would read it as a style tag.
+    console.print(
+        f"[dim]{_safe(telemetry_line(outcome))}[/dim]", soft_wrap=True, highlight=False
+    )
     if result.status not in {"ok", "awaiting_confirmation"}:
-        console.print(
-            f"[dim]status: {_safe(result.status)} · trace {result.trace_id} "
-            f"(/trace {result.trace_id})[/dim]"
-        )
+        console.print(f"[dim]/trace {result.trace_id} replays this turn.[/dim]")
     console.print()
 
 
@@ -175,6 +195,8 @@ def render(agent: Agent, outcome: Outcome) -> None:
             f"[green]Deleted {deleted.deleted_count} report(s).[/green] "
             "[dim]/undo restores them.[/dim]"
         )
+    elif outcome.kind is Kind.REPROMPT:
+        console.print(f"[yellow]{_safe(outcome.text)}[/yellow]")
     elif outcome.kind is Kind.CANCELLED:
         console.print("[yellow]Cancelled — nothing was deleted.[/yellow]")
     elif outcome.kind is Kind.HELP:

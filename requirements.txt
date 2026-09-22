@@ -1,7 +1,5 @@
-# Verified working on Python 3.14.0 (macOS, arm64) on 2026-09-18.
-# Python >= 3.13 recommended: on 3.12, pip resolves google-genai to 1.75.0
-# rather than the 2.x this code was written and verified against.
-# Python >= 3.11 is a hard floor (datetime.UTC, StrEnum, tomllib-era syntax).
+# Verified from a clean install on Python 3.11, 3.12, 3.13 and 3.14 (macOS).
+# Python >= 3.11 is a hard floor (datetime.UTC, enum.StrEnum).
 
 google-genai==2.24.0
 google-cloud-bigquery==3.45.2
@@ -13,14 +11,10 @@ tabulate>=0.9
 sqlglot==30.18.0
 
 rich>=13.7
-prompt_toolkit>=3.0.47
 python-dotenv>=1.0
-pydantic>=2.12
-tenacity>=9.0
 PyYAML>=6.0
 
 pytest>=8.3
-pytest-asyncio>=0.24
 
 # The optional web UI is NOT installed by this file — the CLI is the required
 # interface and should not pull in a web stack. To run it as well:

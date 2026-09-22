@@ -3,7 +3,8 @@
 The prompt is built fresh on every turn from four layers, in this order:
 
     1. Role and capabilities          static
-    2. Schema + metric glossary       config/metrics.yaml
+    2. Today's date, schema + metric  config/metrics.yaml
+       glossary, the user's scope
     3. Persona                        config/persona.yaml   <- editable by non-devs
     4. Safety contract                static, ALWAYS LAST
 
@@ -21,6 +22,8 @@ the next answer with no restart.
 from __future__ import annotations
 
 import os
+import re
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -127,8 +130,11 @@ def render_persona(persona: dict[str, Any]) -> str:
             lines.append(f"  - Report money in {currency}.")
 
     if sections := persona.get("report_sections"):
-        pretty = ", ".join(str(s).replace("_", " ") for s in sections)
-        lines.append(f"\nA full report must contain these sections in order: {pretty}.")
+        headings = ", ".join(f'"{section_heading(str(s))}"' for s in sections)
+        lines.append(
+            f"\nA saved report must use these section headings, in order: {headings}. "
+            "save_report rejects a report that is missing any of them."
+        )
 
     if refusal := persona.get("refusal_style"):
         lines += ["\nWhen declining:", str(refusal).strip()]
@@ -141,9 +147,11 @@ def build_system_prompt(
     *,
     persona_path: Path | str | None = None,
     preferences: str = "",
+    today: date | None = None,
 ) -> str:
     """Assemble the full system prompt for one turn."""
     persona = _load_persona(persona_path)
+    today = today or datetime.now(UTC).date()
 
     scope_block = (
         "This user may analyse the full product catalogue."
@@ -157,6 +165,11 @@ def build_system_prompt(
 
     parts = [
         ROLE,
+        # Without it, every "this year" or "last month" question began with the
+        # model querying CURRENT_DATE() — a guard rejection and two extra model
+        # calls per turn, observed live, just to learn the date.
+        f"--- TODAY ---\n{today:%A %d %B %Y} (UTC). Use this for relative dates "
+        "such as \"this year\" or \"last month\"; there is no need to query it.",
         f"--- DATA ---\n{render_schema()}",
         f"--- METRICS ---\n{render_metrics()}",
         f"--- THIS USER ---\n{scope.display_name or scope.user_id}"
@@ -164,8 +177,9 @@ def build_system_prompt(
     ]
 
     if preferences:
-        # Learned per-user formatting preferences (Requirement 4). Sits above the
-        # safety block, below the persona, so it can shape form but not access.
+        # Learned per-user formatting preferences (Requirement 4). Sits above
+        # both the persona and the safety block — the lowest precedence in
+        # persona.yaml's list — so it can shape form but never tone or access.
         parts.append(f"--- THIS USER'S PREFERENCES ---\n{preferences}")
 
     if persona_text := render_persona(persona):
@@ -173,6 +187,42 @@ def build_system_prompt(
 
     parts.append(SAFETY_CONTRACT)
     return "\n\n".join(parts)
+
+
+def report_sections(persona_path: Path | str | None = None) -> tuple[str, ...]:
+    """The sections persona.yaml requires in a saved report, in order.
+
+    Read fresh, like the rest of the persona, so adding a section to the YAML
+    changes what save_report accepts on the very next turn.
+    """
+    persona = _load_persona(persona_path)
+    if persona.get("_error"):
+        return ()
+    return tuple(str(s) for s in persona.get("report_sections") or ())
+
+
+def section_heading(section: str) -> str:
+    """`what_the_data_shows` -> `What the data shows`."""
+    words = section.replace("_", " ").strip()
+    return words[:1].upper() + words[1:]
+
+
+def missing_report_sections(
+    body: str, persona_path: Path | str | None = None
+) -> list[str]:
+    """Required sections a report body never mentions, in persona order.
+
+    Deliberately loose — case, underscores, hyphens and "&" for "and" are all
+    ignored — because the point is that the report HAS action items and a
+    risks section, not that a heading is typed exactly one way.
+    """
+    def normalise(text: str) -> str:
+        return " ".join(
+            re.sub(r"[_\-]", " ", text.lower().replace("&", " and ")).split()
+        )
+
+    haystack = normalise(body)
+    return [s for s in report_sections(persona_path) if normalise(s) not in haystack]
 
 
 def persona_version(persona_path: Path | str | None = None) -> str:
