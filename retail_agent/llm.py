@@ -36,6 +36,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Protocol, Sequence
 
+from retail_agent.gcp import resolve_project
+
 DEFAULT_MODEL = "gemini-3.6-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
@@ -228,11 +230,16 @@ class GeminiProvider:
         from google import genai
 
         if self.use_vertex:
+            # GOOGLE_CLOUD_PROJECT is an override, not a requirement: without it
+            # Vertex bills the project gcloud is configured for — the same one
+            # the BigQuery runner resolves, by the same function.
+            self.project = resolve_project(self.project)
             if not self.project:
                 raise LLMConfigError(
-                    "LLM_PROVIDER=vertex needs GOOGLE_CLOUD_PROJECT set, and "
-                    "Application Default Credentials "
-                    "(`gcloud auth application-default login`)."
+                    "LLM_PROVIDER=vertex needs a Google Cloud project. Run "
+                    "`gcloud config set project YOUR_PROJECT_ID` (or set "
+                    "GOOGLE_CLOUD_PROJECT in .env) and "
+                    "`gcloud auth application-default login`."
                 )
             try:
                 self.client = genai.Client(
@@ -439,12 +446,16 @@ def build_provider(**kwargs: Any) -> LLMProvider:
     """Pick a provider from the environment.
 
     LLM_PROVIDER:
-      stub    no network, no quota — the whole agent runs offline
+      stub    no model access — the scripted offline demo (retail_agent/demo.py)
       vertex  Vertex AI via Application Default Credentials (no API key)
       gemini  AI Studio API key (default)
     """
     choice = os.getenv("LLM_PROVIDER", "gemini").lower()
     if choice == "stub":
+        # Imported here: demo.py builds LLMResponses, so it imports this module.
+        from retail_agent.demo import demo_responder
+
+        kwargs.setdefault("responder", demo_responder)
         return StubProvider(**kwargs)
     if choice == "vertex":
         kwargs.setdefault("use_vertex", True)

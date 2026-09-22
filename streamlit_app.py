@@ -146,6 +146,9 @@ def render_outcome(agent: Agent, outcome: Outcome) -> None:
                 "someone else."
             )
 
+    elif kind is Kind.REPROMPT:
+        st.warning(outcome.text)
+
     elif kind is Kind.CANCELLED:
         st.warning("Cancelled — nothing was deleted.")
 

@@ -13,8 +13,8 @@ data/*.db
 data/*.db-journal
 var/
 
-# Google Cloud SDK was unpacked inside this project directory.
-# It must never be committed (hundreds of MB of vendored tooling).
+# The Google Cloud SDK installer unpacks into the directory it is run from. If
+# that is ever this project, it must never be committed (hundreds of MB).
 google-cloud-sdk/
 google-cloud-cli-*.tar.gz
 

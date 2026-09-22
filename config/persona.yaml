@@ -11,8 +11,8 @@
 #   1. Safety rules (PII, entitlements, destructive-op confirmation)  <- immovable
 #   2. This persona file                                              <- tone
 #   3. Per-user learned preferences                                   <- format
-# Anything in here that tries to override layer 1 is ignored by the prompt
-# builder, which injects the safety block last.
+# Anything in here that tries to override layer 1 loses: the prompt builder puts
+# the safety block after this file, and the SQL guard never reads it at all.
 
 version: 3
 updated_by: dana.raviv@retailco.example
@@ -34,9 +34,9 @@ style:
   always_state_date_range: true       # every metric answer names the window it used
   always_cite_sql: true               # the SQL that produced the number is shown on request
 
-# Sections a full report must contain, in order. The report tool validates
-# against this list, so adding a section here changes report structure with no
-# code change.
+# Sections a saved report must contain, in order. The prompt asks for these as
+# headings and save_report refuses a report missing any of them, so adding a
+# section here changes report structure on the next turn, with no code change.
 report_sections:
   - headline
   - what_the_data_shows

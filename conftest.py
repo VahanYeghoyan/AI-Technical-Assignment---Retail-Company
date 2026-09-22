@@ -12,6 +12,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_local_state(tmp_path, monkeypatch):
+    """Keep every test's traces and reports out of the developer's var/.
+
+    A Tracer built without an explicit trace_dir falls back to var/traces, so
+    each run of the suite used to append a few dozen fake turns to the same
+    trace files `/trace` reads.
+    """
+    monkeypatch.setenv("TRACE_DIR", str(tmp_path / "traces"))
+    monkeypatch.setenv("REPORTS_DB_PATH", str(tmp_path / "reports.db"))

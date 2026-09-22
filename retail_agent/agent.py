@@ -38,7 +38,12 @@ from retail_agent.llm import (
     LLMResponse,
 )
 from retail_agent.observability import Tracer
-from retail_agent.prompt import build_system_prompt, persona_version
+from retail_agent.prompt import (
+    build_system_prompt,
+    missing_report_sections,
+    persona_version,
+    section_heading,
+)
 from retail_agent.reports import ReportStore
 from retail_agent.safety.pii import scrub_text
 from retail_agent.safety.scope import Scope
@@ -93,7 +98,9 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "name": "save_report",
         "description": (
             "Save an analysis as a report in the user's library. Use when the "
-            "user asks for a report. Include action items."
+            "user asks for a report. The body must use every report section "
+            "heading listed in your instructions, including action items; a "
+            "report missing one is rejected, not saved."
         ),
         "parameters_json_schema": {
             "type": "object",
@@ -199,16 +206,16 @@ class Agent:
         except LLMQuotaError as err:
             result = self._degrade(
                 "The language model quota for this deployment is exhausted, so I "
-                "cannot analyse anything right now. This needs credits topped up "
-                "on the API key — retrying will not help.",
+                "cannot analyse anything right now. It needs more quota or "
+                "credits for the model account — retrying will not help.",
                 status="quota_exhausted",
                 error=err,
             )
         except LLMConfigError as err:
             result = self._degrade(
                 "The language model is misconfigured for this deployment, so I "
-                "cannot answer right now. An operator needs to check the API key "
-                "and model settings.",
+                "cannot answer right now. An operator needs to check the model "
+                "settings — project, API access or key, and model name.",
                 status="config_error",
                 error=err,
             )
@@ -420,6 +427,19 @@ class Agent:
         """
         title, title_hits = scrub_text(str(args.get("title", "Untitled report")))
         body, body_hits = scrub_text(str(args.get("body", "")))
+
+        # persona.yaml's report_sections, enforced rather than only requested:
+        # a report without its action items is not the report the user asked
+        # for, and the model can fix that in one more call.
+        missing = missing_report_sections(body)
+        if missing:
+            headings = ", ".join(f'"{section_heading(s)}"' for s in missing)
+            self.tracer.emit("report.rejected", missing=missing)
+            return {
+                "saved": False,
+                "error": f"Not saved — missing required section(s): {headings}. "
+                         "Add them as headings and call save_report again.",
+            }
         raw_entities = args.get("entities") or []
         if isinstance(raw_entities, str):  # the model sometimes sends one string
             raw_entities = [raw_entities]
@@ -454,6 +474,9 @@ class Agent:
             ),
             all_reports=bool(args.get("all_reports")),
         )
+        if pending.selector == "none":
+            # A deletion that named nothing to match is refused, not guessed.
+            self.tracer.metrics.refusals += 1
         self.tracer.audit(
             "deletion_proposed",
             count=len(pending.targets),
@@ -500,9 +523,10 @@ class Agent:
         self.tracer.emit("sql.unavailable", kind=kind)
         if kind == str(QueryErrorKind.PERMISSION):
             message = (
-                "I cannot reach the data warehouse — this deployment's "
-                "credentials were refused. That needs an operator, not a "
-                "different question. Your saved reports are unaffected."
+                "I cannot reach the data warehouse — this deployment's Google "
+                "Cloud credentials are missing or were refused. That needs an "
+                "operator, not a different question. Your saved reports are "
+                "unaffected."
             )
             status = "warehouse_permission"
         elif kind in {str(QueryErrorKind.TRANSIENT), str(QueryErrorKind.TIMEOUT),
@@ -553,8 +577,9 @@ class Agent:
         )
 
     def _append(self, role: str, text: str) -> None:
+        if role == "user":
+            self._trim()  # before a new turn, never in the middle of one
         self.history.append({"role": role, "parts": [{"text": text}]})
-        self._trim()
 
     def _append_function_calls(self, function_calls: Sequence[FunctionCall]) -> None:
         """Echo one model step back as one model turn, parts in order.
@@ -588,11 +613,21 @@ class Agent:
             # correspondence a trace has to be able to replay.
             self.tracer.emit("tool.result", name=name, response=clean)
         self.history.append({"role": "user", "parts": parts})
-        self._trim()
 
     def _trim(self) -> None:
-        # Keep the transcript bounded so a long session cannot grow the prompt
-        # (and its cost) without limit.
-        limit = MAX_HISTORY_TURNS * 4
-        if len(self.history) > limit:
-            self.history = self.history[-limit:]
+        """Keep the last MAX_HISTORY_TURNS turns, cutting only where one starts.
+
+        Bounded so a long session cannot grow the prompt (and its cost) without
+        limit. It used to cut a fixed number of entries, which lands wherever
+        the arithmetic says: after a mix of short and tool-heavy turns the
+        history opened on a function_response whose call had been cut away —
+        a tool result answering nothing.
+        """
+        starts = [
+            index
+            for index, content in enumerate(self.history)
+            if content["role"] == "user" and "text" in content["parts"][0]
+        ]
+        keep = MAX_HISTORY_TURNS - 1  # leaving room for the turn about to start
+        if len(starts) > keep:
+            self.history = self.history[starts[len(starts) - keep]:] if keep else []

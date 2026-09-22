@@ -17,14 +17,17 @@ Strictness is proportional to blast radius, which is what keeps it usable:
     4+ reports    the user must type the count ("delete 7").
                   A blind "yes" to a runaway match set is the failure mode that
                   actually hurts, and it is the one thing a reflexive yes cannot do.
+                  A "yes" or a wrong count is answered with the count to type,
+                  and the proposal stays open.
 
 Plus three rules regardless of size:
 
   * The match set is always shown first, itemised, before any confirmation.
-  * Proposals expire (default 5 minutes). Confirming a stale proposal re-runs
-    the search rather than deleting whatever matched minutes ago.
-  * Anything that is not a confirmation cancels the proposal and is handled as
-    a normal turn. The user never has to fight their way out of a prompt.
+  * Proposals expire (default 5 minutes). A reply to an expired proposal
+    deletes nothing and is handled as an ordinary message, so nothing is ever
+    deleted on the strength of a match set that is minutes old.
+  * Anything else cancels the proposal and is handled as a normal turn. The
+    user never has to fight their way out of a prompt.
 
 Deletes are soft (see reports.py), so even a confirmed mistake is recoverable
 for 30 days — which is what makes the "yes" tier defensible.
@@ -121,6 +124,14 @@ class PendingDeletion:
             "Anything else cancels.",
         ]
         return "\n".join(lines)
+
+    def reprompt(self) -> str:
+        """Shown when a bulk proposal gets a "yes" or the wrong count."""
+        n = len(self.targets)
+        return (
+            f"This deletes {n} reports, so it needs the count: type "
+            f"'delete {n}' to confirm. Anything else cancels."
+        )
 
 
 @dataclass
@@ -226,8 +237,9 @@ class ConfirmationBroker:
     def interpret(self, actor: str, message: str) -> str:
         """Classify a reply to a live proposal.
 
-        Returns "confirm", "cancel", or "none" (no live proposal — handle the
-        message as an ordinary turn).
+        Returns "confirm", "cancel", "reprompt" (the user plainly means yes, but
+        a bulk delete needs the count — ask again, delete nothing), or "none"
+        (no live proposal — handle the message as an ordinary turn).
         """
         pending = self.pending_for(actor)
         if pending is None:
@@ -240,9 +252,14 @@ class ConfirmationBroker:
         if pending.requires_count:
             # Accept "delete 7" / "7" / "confirm 7" — the number is the point.
             match = re.fullmatch(r"(?:delete\s+|confirm\s+)?(\d+)", normalised)
-            if match and int(match.group(1)) == len(pending.targets):
-                return "confirm"
-            return "cancel"
+            if match:
+                if int(match.group(1)) == len(pending.targets):
+                    return "confirm"
+                return "reprompt"  # a miscount is not a change of mind
+            # A bare "yes" used to cancel AND go on to the model as a new
+            # question, which usually proposed the same deletion again. The
+            # user meant yes; say what yes costs here and wait.
+            return "reprompt" if normalised in _AFFIRMATIVE else "cancel"
 
         return "confirm" if normalised in _AFFIRMATIVE else "cancel"
 

@@ -88,6 +88,9 @@ class TurnMetrics:
     bq_bytes_billed: int = 0
     empty_results: int = 0
     pii_redactions: int = 0
+    # Requests the code refused on policy grounds: a PII, whole-row, write or
+    # out-of-dataset query, or a deletion that named nothing to match. Refusals
+    # the model makes in prose are not counted — they need an eval to detect.
     refusals: int = 0
     retries: int = 0
     fallback_model_used: bool = False
