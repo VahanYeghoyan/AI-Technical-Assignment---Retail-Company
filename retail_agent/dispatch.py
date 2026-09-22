@@ -4,13 +4,15 @@ Every frontend — the CLI REPL and the Streamlit UI — has to make the same th
 decisions in the same order, and the order is a safety property rather than a
 cosmetic one:
 
-  1. A live deletion confirmation owns the next message. If "yes" were routed to
+  1. Slash commands bypass the model, so /undo, /reports and /trace keep working
+     during an LLM outage — which, with an exhausted quota, is exactly the state
+     this prototype has to stay usable in. They also leave a pending deletion
+     alone: checking /reports before answering "yes" is the careful thing to
+     do, and it used to cancel the very proposal being checked.
+  2. A live deletion confirmation owns the next reply. If "yes" were routed to
      the model like any other text, the model would answer it conversationally
      and the pending deletion would be lost — or worse, re-proposed and
      double-confirmed.
-  2. Slash commands bypass the model, so /undo, /reports and /trace keep working
-     during an LLM outage — which, with an exhausted quota, is exactly the state
-     this prototype has to stay usable in.
   3. Everything else is a question for the agent.
 
 This module makes those decisions and reports *what happened*. It renders
@@ -33,16 +35,9 @@ from enum import StrEnum
 from typing import Any, Callable, ContextManager
 
 from retail_agent.agent import Agent, TurnResult
+from retail_agent.confirmation import is_refusal
 from retail_agent.observability import read_events, summarise_turns
 from retail_agent.reports import DeleteOutcome, Report
-
-# Replies that end the turn once they have cancelled a pending deletion. A reply
-# that is *only* a refusal has said everything it means to say; anything longer
-# ("no, show me Q2 instead") is treated as a new question so the user is never
-# trapped in a prompt. Deliberately narrower than the broker's negative set: the
-# broker decides whether a proposal is cancelled, this decides whether there is
-# anything left to answer.
-_PURE_NEGATIVES = frozenset({"no", "n", "cancel", "stop", "abort"})
 
 # Turns shown by /trace with no argument.
 RECENT_TURNS = 15
@@ -105,9 +100,14 @@ def dispatch(
     if not stripped:
         return [Outcome(Kind.EMPTY)]
 
+    # 1. Slash commands work even when the model is unavailable, and are not
+    #    replies: a pending deletion stays pending through them.
+    if stripped.startswith("/"):
+        return [_slash_command(agent, stripped)]
+
     outcomes: list[Outcome] = []
 
-    # 1. A pending destructive action owns the next message.
+    # 2. A pending destructive action owns the next reply.
     verdict = agent.broker.interpret(agent.scope.user_id, stripped)
     if verdict == "confirm":
         deleted = agent.broker.confirm(agent.scope.user_id)
@@ -135,14 +135,13 @@ def dispatch(
             criteria=cancelled.criteria if cancelled else "",
         )
         outcomes.append(Outcome(Kind.CANCELLED))
-        if stripped.lower() in _PURE_NEGATIVES:
+        # A reply that is only a no ("No.", "never mind") has said all it
+        # means to. It used to be matched raw, so "No." cancelled and then went
+        # to the model as a question — a paid call to answer "No.".
+        if is_refusal(stripped):
             return outcomes
-        # Otherwise fall through: the message was probably a new question.
-
-    # 2. Slash commands work even when the model is unavailable.
-    if stripped.startswith("/"):
-        outcomes.append(_slash_command(agent, stripped))
-        return outcomes
+        # Otherwise fall through: the message was probably a new question
+        # ("no, show me Q2 instead"), and the user is never trapped in a prompt.
 
     # 3. Otherwise it is a question for the agent.
     with progress():
@@ -170,12 +169,28 @@ def _slash_command(agent: Agent, stripped: str) -> Outcome:
         return Outcome(Kind.HELP)
 
     if command == "reports":
+        if argument.lower() == "deleted":
+            # Everything still restorable, from any session: /undo alone only
+            # remembers the batch deleted in this one.
+            return Outcome(
+                Kind.REPORTS,
+                text="deleted",
+                reports=agent.store.list_restorable(agent.scope.user_id),
+            )
         return Outcome(
             Kind.REPORTS, reports=agent.store.list_for_user(agent.scope.user_id)
         )
 
     if command == "undo":
-        restored = agent.store.restore(agent.last_deleted, actor=agent.scope.user_id)
+        if argument:
+            # `/undo <id>`: any report of the caller's deleted within the
+            # restore window — the half of "restorable for 30 days" that has to
+            # survive a restart. Owner-scoped, like every other lookup.
+            report = agent.store.resolve_id(argument, owner=agent.scope.user_id)
+            ids: tuple[str, ...] = (report.report_id,) if report else ()
+        else:
+            ids = agent.last_deleted
+        restored = agent.store.restore(ids, actor=agent.scope.user_id)
         # A restore changes who can see what, exactly as a delete does, so it
         # belongs in the same audit stream rather than nowhere.
         agent.tracer.audit(
@@ -183,7 +198,7 @@ def _slash_command(agent: Agent, stripped: str) -> Outcome:
             count=len(restored),
             report_ids=[r.report_id for r in restored],
         )
-        return Outcome(Kind.UNDO, restored=restored)
+        return Outcome(Kind.UNDO, text=argument, restored=restored)
 
     if command == "trace":
         if argument:

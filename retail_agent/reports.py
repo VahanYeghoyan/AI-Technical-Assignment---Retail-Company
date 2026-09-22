@@ -11,10 +11,10 @@ mentioning Client X" safe to support at all:
     irreversible into a 30-day undo. purge() is the only hard delete, and no
     agent tool is wired to it.
 
-  * Ownership is enforced here, not in the prompt. delete() silently refuses
-    rows the actor does not own and REPORTS them as skipped, so the user is told
-    "3 deleted, 2 skipped (not yours)" rather than the agent either failing
-    entirely or quietly over-deleting.
+  * Ownership is enforced here, not in the prompt. Every read is scoped to the
+    actor, so another user's reports never appear in a match set at all, and
+    delete() still refuses — and reports as skipped — any row the actor does
+    not own, in case an id arrives by some other route.
 
   * Search is substring matching over title + body + entity tags. "Mentioning
     Client X" has no structured answer in a B2C dataset, so the match set is
@@ -224,12 +224,34 @@ class ReportStore:
         ).fetchone()
         return self._row_to_report(row) if row else None
 
-    def resolve_id(self, prefix: str) -> Report | None:
-        """Look up by the short id shown in listings ([1a2b3c4d])."""
+    def resolve_id(self, prefix: str, *, owner: str) -> Report | None:
+        """Look up one of `owner`'s reports by the short id shown in listings.
+
+        Owner-scoped, and the prefix is matched literally: an unscoped lookup
+        answered "is there a report starting with 'a'?" about everyone's
+        library, and a bare `%` matched the first row of anyone's.
+        """
+        prefix = prefix.strip().strip("[]")
+        if not prefix:
+            return None
         row = self._conn.execute(
-            "SELECT * FROM reports WHERE report_id LIKE ? || '%'", (prefix,)
+            "SELECT * FROM reports WHERE owner = ? AND report_id LIKE ? ESCAPE '\\'"
+            " ORDER BY created_at DESC",
+            (owner, f"{_escape_like(prefix)}%"),
         ).fetchone()
         return self._row_to_report(row) if row else None
+
+    def list_restorable(self, owner: str) -> tuple[Report, ...]:
+        """The owner's soft-deleted reports still inside the restore window."""
+        cutoff = (datetime.now(UTC) - timedelta(days=RESTORE_WINDOW_DAYS)).isoformat(
+            timespec="seconds"
+        )
+        rows = self._conn.execute(
+            "SELECT * FROM reports WHERE owner = ? AND deleted_at IS NOT NULL"
+            " AND deleted_at >= ? ORDER BY deleted_at DESC",
+            (owner, cutoff),
+        ).fetchall()
+        return tuple(self._row_to_report(r) for r in rows)
 
     def list_for_user(
         self, owner: str, *, include_deleted: bool = False
@@ -247,21 +269,18 @@ class ReportStore:
         actor: str,
         text: str | None = None,
         conversation_id: str | None = None,
-        owned_only: bool = True,
         include_deleted: bool = False,
     ) -> tuple[Report, ...]:
-        """Find reports for a deletion proposal or a listing.
+        """Find the actor's reports, for a deletion proposal or a listing.
 
-        owned_only defaults to True: a delete proposal should surface only what
-        the actor can actually act on. Pass False to show the wider match set
-        (used to tell the user "2 more match but belong to someone else").
+        Always scoped to the actor. There used to be an owned_only=False mode,
+        used to tell the user "2 more match but belong to someone else" — which
+        let anyone test whether another executive's reports contain a phrase.
+        No caller needs to search other people's libraries, so none can.
         """
-        clauses: list[str] = []
-        params: list[object] = []
+        clauses: list[str] = ["owner = ?"]
+        params: list[object] = [actor]
 
-        if owned_only:
-            clauses.append("owner = ?")
-            params.append(actor)
         if not include_deleted:
             clauses.append("deleted_at IS NULL")
         if conversation_id:
@@ -276,9 +295,7 @@ class ReportStore:
             )
             params.extend([needle, needle, needle])
 
-        sql = "SELECT * FROM reports"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
+        sql = "SELECT * FROM reports WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC"
         rows = self._conn.execute(sql, params).fetchall()
         return tuple(self._row_to_report(r) for r in rows)

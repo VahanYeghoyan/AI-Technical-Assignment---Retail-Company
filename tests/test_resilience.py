@@ -26,6 +26,7 @@ from retail_agent.llm import (
     LLMConfigError,
     LLMQuotaError,
     LLMResponse,
+    LLMTimeoutError,
     LLMTransientError,
     StubProvider,
 )
@@ -44,13 +45,21 @@ SIMPLE_SQL = "SELECT COUNT(*) AS n FROM orders"
 
 
 class FakeJob:
-    def __init__(self, dataframe: pd.DataFrame, total_bytes_processed: int = 1000):
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        total_bytes_processed: int = 1000,
+        total_bytes_billed: int | None = None,
+    ):
         self._dataframe = dataframe
         self.total_bytes_processed = total_bytes_processed
+        if total_bytes_billed is not None:
+            self.total_bytes_billed = total_bytes_billed
         self.max_results_requested = "never called"
 
-    def result(self, timeout=None, max_results=None):  # noqa: ARG002
+    def result(self, timeout=None, max_results=None, **kwargs):  # noqa: ARG002
         self.max_results_requested = max_results
+        self.result_kwargs = kwargs
         return FakeRows(self._dataframe, max_results)
 
 
@@ -75,9 +84,13 @@ class FakeBQClient:
     anything else is returned as a job.
     """
 
-    def __init__(self, behaviours=None, dry_run_bytes: int = 1000, dataframe=None):
+    def __init__(
+        self, behaviours=None, dry_run_bytes: int = 1000, dataframe=None,
+        bytes_billed: int | None = None,
+    ):
         self.behaviours = list(behaviours or [])
         self.dry_run_bytes = dry_run_bytes
+        self.bytes_billed = bytes_billed
         self.dataframe = (
             dataframe if dataframe is not None else pd.DataFrame({"n": [42]})
         )
@@ -89,9 +102,12 @@ class FakeBQClient:
         # cannot catch that class of defect.
         self.dry_run_configs: list[object] = []
         self.executed_configs: list[object] = []
+        # Keyword arguments of every query() call: retry, timeout, job_retry.
+        self.query_kwargs: list[dict] = []
 
-    def query(self, sql, job_config=None):
+    def query(self, sql, job_config=None, **kwargs):
         self.queries.append(sql)
+        self.query_kwargs.append(kwargs)
         if job_config is not None and getattr(job_config, "dry_run", False):
             self.dry_run_configs.append(job_config)
             return FakeJob(pd.DataFrame(), total_bytes_processed=self.dry_run_bytes)
@@ -101,7 +117,7 @@ class FakeBQClient:
             behaviour = self.behaviours.pop(0)
             if isinstance(behaviour, Exception):
                 raise behaviour
-        self.last_job = FakeJob(self.dataframe)
+        self.last_job = FakeJob(self.dataframe, total_bytes_billed=self.bytes_billed)
         return self.last_job
 
 
@@ -232,11 +248,11 @@ def test_a_dry_run_blip_is_retried_rather_than_failing_the_query():
             super().__init__()
             self.first = True
 
-        def query(self, sql, job_config=None):
+        def query(self, sql, job_config=None, **kwargs):
             if self.first:
                 self.first = False
                 raise gexc.ServiceUnavailable("503 blip")
-            return super().query(sql, job_config)
+            return super().query(sql, job_config, **kwargs)
 
     result = runner(BlipOnFirstCall()).execute(SIMPLE_SQL, UNRESTRICTED)
     assert result.row_count == 1
@@ -247,7 +263,7 @@ def test_the_breaker_opens_when_the_outage_hits_the_dry_run():
     # failures counted only during execution, the breaker could never open no
     # matter how long BigQuery stayed down.
     class AlwaysDown(FakeBQClient):
-        def query(self, sql, job_config=None):
+        def query(self, sql, job_config=None, **kwargs):
             self.queries.append(sql)
             raise gexc.ServiceUnavailable("503 backend error")
 
@@ -272,16 +288,16 @@ def test_a_timed_out_job_is_cancelled_before_the_retry():
             self.job_id = "job-1"
             self.total_bytes_processed = 10
 
-        def result(self, timeout=None, max_results=None):  # noqa: ARG002
+        def result(self, timeout=None, max_results=None, **kwargs):  # noqa: ARG002
             raise TimeoutError("job still running")
 
         def cancel(self):
             cancels.append(self.job_id)
 
     class SlowClient(FakeBQClient):
-        def query(self, sql, job_config=None):
+        def query(self, sql, job_config=None, **kwargs):
             if job_config is not None and getattr(job_config, "dry_run", False):
-                return super().query(sql, job_config)
+                return super().query(sql, job_config, **kwargs)
             self.executed.append(sql)
             return NeverFinishes()
 
@@ -302,7 +318,7 @@ def test_lost_credentials_are_a_permission_error_not_a_mystery():
     RefreshError.__name__ = "RefreshError"
 
     class NoCredentials(FakeBQClient):
-        def query(self, sql, job_config=None):
+        def query(self, sql, job_config=None, **kwargs):
             raise RefreshError("could not refresh the access token")
 
     with pytest.raises(QueryError) as err:
@@ -314,7 +330,7 @@ def test_lost_credentials_are_a_permission_error_not_a_mystery():
 
 def test_a_dropped_network_is_transient_not_unknown():
     class Offline(FakeBQClient):
-        def query(self, sql, job_config=None):
+        def query(self, sql, job_config=None, **kwargs):
             raise ConnectionError("Max retries exceeded: network unreachable")
 
     with pytest.raises(QueryError) as err:
@@ -339,6 +355,118 @@ def test_circuit_breaker_opens_after_repeated_failures():
     assert err.value.kind is QueryErrorKind.CIRCUIT_OPEN
     # Fails fast: the open circuit means no further calls reach BigQuery.
     assert len(client.executed) == executed_before
+
+
+def test_every_bigquery_call_bounds_the_client_librarys_own_retries():
+    # google-cloud-bigquery retries for up to 10 minutes per call, and re-runs
+    # failed jobs for up to 40, underneath everything this module does. Left
+    # at those defaults, a dead endpoint hung a query for 19 minutes.
+    from retail_agent.bigquery_runner import API_REQUEST_TIMEOUT_S
+
+    client = FakeBQClient()
+    runner(client, api_retry_s=7).execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert len(client.query_kwargs) == 2  # dry run and execution
+    for kwargs in client.query_kwargs:
+        assert kwargs["retry"].timeout == 7
+        assert kwargs["timeout"] == API_REQUEST_TIMEOUT_S
+        assert kwargs["job_retry"] is None
+    assert client.last_job.result_kwargs["retry"].timeout == 7
+    assert client.last_job.result_kwargs["job_retry"] is None
+
+
+def test_the_librarys_retries_giving_up_is_an_outage_not_a_mystery():
+    # What the client raises once its own retries are spent. It matched no rule
+    # and became UNKNOWN: a generic error for the user, nothing for the breaker.
+    gave_up = gexc.RetryError(
+        "Timeout of 10.0s exceeded", ConnectionError("connection refused")
+    )
+    client = FakeBQClient(behaviours=[gave_up])
+    bq = runner(client)
+
+    with pytest.raises(QueryError) as err:
+        bq.execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert err.value.kind is QueryErrorKind.UNAVAILABLE
+    assert len(client.executed) == 1  # the library already retried; we do not
+    assert bq._breaker._failures == 1  # but the breaker counts it
+
+
+def test_a_dead_endpoint_fails_in_seconds_with_the_real_client():
+    # Contract test against the real google-cloud-bigquery client, pointed at a
+    # port nobody listens on. Measured before this fix: 1,136 s, kind=unknown,
+    # zero breaker failures.
+    import socket
+    import time
+
+    from google.auth.credentials import AnonymousCredentials
+    from google.cloud import bigquery
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()  # now nothing is listening there
+
+    client = bigquery.Client(
+        project="test-project",
+        credentials=AnonymousCredentials(),
+        client_options={"api_endpoint": f"http://127.0.0.1:{port}"},
+    )
+    bq = runner(client, api_retry_s=0.5)
+
+    started = time.monotonic()
+    with pytest.raises(QueryError) as err:
+        bq.execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert time.monotonic() - started < 10
+    assert err.value.kind is QueryErrorKind.UNAVAILABLE
+    assert bq._breaker._failures == 1
+
+
+def test_an_exhausted_project_quota_is_not_called_a_credentials_problem():
+    # BigQuery answers 403 for this too. A sandbox project that had spent its
+    # free 1 TB/month was told its credentials were missing.
+    spent = gexc.Forbidden(
+        "Quota exceeded: Your project exceeded quota for free query bytes scanned.",
+        errors=[{"reason": "quotaExceeded"}],
+    )
+    client = FakeBQClient(behaviours=[spent])
+    with pytest.raises(QueryError) as err:
+        runner(client).execute(SIMPLE_SQL, UNRESTRICTED)
+
+    assert err.value.kind is QueryErrorKind.QUOTA
+    assert err.value.retriable_by_model is False
+    assert len(client.executed) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        gexc.Forbidden(
+            "Exceeded rate limits: too many concurrent queries",
+            errors=[{"reason": "rateLimitExceeded"}],
+        ),
+        gexc.BadGateway("502 bad gateway"),
+    ],
+    ids=["403-rate-limit", "502"],
+)
+def test_rate_limits_and_bad_gateways_are_retried(error):
+    client = FakeBQClient(behaviours=[error])
+    result = runner(client).execute(SIMPLE_SQL, UNRESTRICTED)
+    assert result.row_count == 1
+    assert len(client.executed) == 2
+
+
+def test_bytes_billed_is_what_bigquery_charges_not_what_it_scanned():
+    # BigQuery bills a 10 MB minimum per table referenced; the counter labelled
+    # "bytes billed" was reporting bytes processed.
+    client = FakeBQClient(bytes_billed=10_485_760)
+    tracer = Tracer(user_id="ceo", conversation_id="c1")
+
+    runner(client).execute(SIMPLE_SQL, UNRESTRICTED, tracer=tracer)
+
+    assert tracer.metrics.bq_bytes_billed == 10_485_760
+    assert tracer.metrics.bq_bytes_processed == 1000
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +775,113 @@ def test_retired_model_falls_back_to_the_secondary():
     assert response.text == "from fallback"
     assert response.used_fallback is True
     assert provider.client.models.calls == ["gemini-2.5-flash", "gemini-3.6-flash"]
+
+
+def test_a_stalled_model_falls_back_without_retrying_the_same_model():
+    # Each retry against a model that just timed out costs another full
+    # timeout, so the stalled model gets one attempt and the fallback one more.
+    import httpx
+
+    stalled = httpx.ReadTimeout("timed out")
+    provider = gemini(
+        [stalled, _fake_genai_response("from fallback")],
+        model="gemini-3.6-flash",
+        fallback_model="gemini-3.1-flash-lite",
+        max_attempts=3,
+    )
+
+    response = provider.generate(system="s", contents=[])
+
+    assert response.text == "from fallback"
+    assert provider.client.models.calls == ["gemini-3.6-flash", "gemini-3.1-flash-lite"]
+
+
+def test_a_timeout_on_both_models_is_a_timeout_error():
+    import httpx
+
+    provider = gemini(
+        [httpx.ReadTimeout("timed out")] * 2,
+        model="gemini-3.6-flash",
+        fallback_model="gemini-3.1-flash-lite",
+    )
+    with pytest.raises(LLMTimeoutError):
+        provider.generate(system="s", contents=[])
+    assert len(provider.client.models.calls) == 2
+
+
+def test_an_unreachable_model_endpoint_is_transient_and_retried():
+    # A raw httpx transport error, not a genai APIError: it used to become a
+    # bare LLMError that was neither retried nor sent to the fallback.
+    import httpx
+
+    provider = gemini(
+        [httpx.ConnectError("network unreachable"), _fake_genai_response("back")]
+    )
+    assert provider.generate(system="s", contents=[]).text == "back"
+
+
+def test_the_real_client_is_built_with_a_timeout(monkeypatch):
+    # Contract test against the real google-genai client, not a fake: a local
+    # server accepts the connection and never answers. google-genai sets no
+    # timeout of its own, so before this the call simply never returned.
+    import socket
+    import threading
+    import time
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    held: list = []
+
+    def accept_forever():
+        while True:
+            try:
+                held.append(server.accept())
+            except OSError:
+                return
+
+    threading.Thread(target=accept_forever, daemon=True).start()
+    monkeypatch.setenv(
+        "GOOGLE_GEMINI_BASE_URL", f"http://127.0.0.1:{server.getsockname()[1]}"
+    )
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_TIMEOUT_S", "0.3")
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+
+    provider = GeminiProvider(
+        model="primary", fallback_model="fallback", sleep=lambda _s: None
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(LLMTimeoutError):
+            provider.generate(
+                system="s", contents=[{"role": "user", "parts": [{"text": "hi"}]}]
+            )
+    finally:
+        server.close()
+
+    assert time.monotonic() - started < 5
+    assert len(held) == 2  # one attempt per model, no retry of the stalled one
+
+
+def test_temperature_is_left_to_the_model_unless_configured(monkeypatch):
+    # Google's Gemini 3 guidance: keep the default of 1.0; lower values can loop.
+    monkeypatch.delenv("GEMINI_TEMPERATURE", raising=False)
+    provider = gemini([_fake_genai_response("ok")])
+    provider.generate(system="s", contents=[])
+    assert provider.temperature is None
+
+    monkeypatch.setenv("GEMINI_TEMPERATURE", "0.7")
+    assert gemini([]).temperature == 0.7
+
+
+def test_thinking_tokens_are_counted():
+    # Gemini 3 bills its reasoning as output but reports it separately; one
+    # live call used 480 thinking tokens for a 28-token answer.
+    response = _fake_genai_response("ok", output_tokens=28)
+    response.usage_metadata.thoughts_token_count = 480
+    parsed = gemini([response]).generate(system="s", contents=[])
+    assert (parsed.output_tokens, parsed.thinking_tokens) == (28, 480)
 
 
 def test_call_budget_caps_a_runaway_loop():

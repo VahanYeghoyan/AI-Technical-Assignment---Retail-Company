@@ -14,20 +14,20 @@ implements in design only.
 
 | Requirement | State | Tests |
 |---|---|---|
-| Safety & PII masking | Implemented | 78 in `tests/test_safety.py` |
-| High-stakes oversight (destructive ops) | Implemented | 22 in `tests/test_reports.py` |
-| Resilience & error handling | Implemented | 45 in `tests/test_resilience.py` |
+| Safety & PII masking | Implemented | 82 in `tests/test_safety.py` |
+| High-stakes oversight (destructive ops) | Implemented | 25 in `tests/test_reports.py` |
+| Resilience & error handling | Implemented | 58 in `tests/test_resilience.py` |
 | Observability | Implemented, replayable traces | 7 in `tests/test_reports.py` |
 | Hybrid intelligence (Golden Bucket) | Design only — [architecture](docs/architecture.md#31-hybrid-intelligence--the-golden-bucket) | — |
 | Learning loop | Design only | — |
 | Quality assurance | Design only | — |
 | Agility (persona) | Implemented (hot-reload) + design | in `tests/test_agent.py` |
 
-`tests/test_agent.py` (44) exercises all of them end to end through the agent
-loop and the CLI; `tests/test_demo.py` (9) covers the offline demo and
+`tests/test_agent.py` (55) exercises all of them end to end through the agent
+loop and the CLI; `tests/test_demo.py` (13) covers the offline demo and
 `tests/test_streamlit_ui.py` (8) the optional web UI.
 
-**213 tests pass with no credentials and no LLM quota** — 205 of them without the
+**248 tests pass with no credentials and no LLM quota** — 240 of them without the
 optional web UI installed, whose tests skip when streamlit is absent. That is
 deliberate: the safety and oversight guarantees are the ones that must be
 verifiable in CI on any machine, without reaching a third party.
@@ -109,6 +109,7 @@ carries a trace id — `/trace <id>` shows the exact error. The usual causes:
 | Symptom | Fix |
 |---|---|
 | "the data warehouse … credentials are missing or were refused" | Application Default Credentials are missing, or the project cannot run BigQuery jobs: `gcloud auth application-default login`, then `gcloud config set project …` |
+| "… has used up its BigQuery quota" | The project has spent its BigQuery quota — on a sandbox, the free 1 TB of queries a month. Enable billing or wait for the monthly reset |
 | "The language model is misconfigured" (Vertex) | `gcloud services enable aiplatform.googleapis.com`, and check the project has billing — or switch to `LLM_PROVIDER=gemini` |
 | "The language model quota … is exhausted" | The AI Studio free tier is spent: switch to Vertex, or run the offline demo below |
 
@@ -156,6 +157,7 @@ requirements can be checked on a machine with no model access at all:
 | `top brands by revenue this year` | the scope-rewritten query: real rows with BigQuery credentials, a graceful stop without them |
 | `create a report on denim`, then `/reports` | the report library |
 | `delete the reports from this conversation`, then `yes`, then `/undo` | the confirmation flow and the soft delete |
+| `/reports deleted`, then `/undo <id>` | restoring from any later session, within 30 days |
 | `/trace` | the event stream behind each of those turns |
 
 It is not an analyst — every data question gets the same query. It exists
@@ -169,7 +171,14 @@ its own resilience requirement, and because this project's API key hit
 
 Real output from 2026-09-22, signed in as `maya` (VP, Women's Division) against
 live Vertex Gemini 3.6 Flash and live BigQuery, from a clean checkout set up
-exactly as above — `cp .env.example .env`, no project in `.env`:
+exactly as above — `cp .env.example .env`, no project in `.env`.
+
+The telemetry lines below predate two counter fixes: `bytes=` then showed bytes
+*processed*, and Gemini's thinking tokens were not shown at all. The same first
+question, asked again after those fixes, ends
+`[status=ok llm=2 sql=1 corrections=0 tok=5356->613 think=761 bytes=20,971,520 …]`
+— 20 MB billed for 9.9 MB scanned (BigQuery's 10 MB minimum per table), and more
+tokens spent thinking than answering.
 
 ```
 › What were my top 3 brands by revenue this year?
@@ -280,7 +289,8 @@ GROUP BY p.brand
 | Command | Does |
 |---|---|
 | `/reports` | list your saved reports |
-| `/undo` | restore the reports deleted most recently |
+| `/reports deleted` | deleted reports you can still restore (30 days) |
+| `/undo [id]` | restore the reports just deleted, or one by its id from any session |
 | `/trace [id]` | recent turns, or the full event stream for one turn |
 | `/whoami` | identity, data scope, persona version |
 | `/persona` | show the live persona version |
@@ -374,16 +384,21 @@ Strictness scales with blast radius, so the flow stays usable:
   blocks: a "yes" or a wrong count is answered with the count to type, and the
   proposal stays open.
 - Anything else cancels and is handled as a normal question — the user is never
-  trapped in a prompt.
+  trapped in a prompt. A plain "no." or "never mind" just cancels; slash
+  commands are not replies, so checking `/reports` first leaves the proposal
+  open.
 - A deletion request with **no selector is refused**, not treated as "all". The
   model must pass the text it matched on, this conversation, or an explicit
   `all_reports` — and an unfiltered delete is relabelled "ALL of your saved
   reports" in the prompt, whatever the model called it.
 - Proposals expire after 5 minutes.
 - The match set is always itemised *before* confirmation.
-- Deletes are **soft**, restorable for 30 days via `/undo`, and audit-logged.
-- Reports belonging to other users are refused and reported as skipped, rather
-  than silently dropped from the count.
+- Deletes are **soft**, restorable for 30 days, and audit-logged: `/undo` right
+  after, or `/reports deleted` and `/undo <id>` from any later session.
+- A match set only ever contains the caller's own reports, and other users'
+  matches are not even counted. The prompt used to add "(2 more match but belong
+  to someone else)", which let anyone test — one guess at a time — what another
+  executive's reports say. Ownership is checked again when the delete executes.
 
 ### Resilience & graceful error handling
 
@@ -397,8 +412,11 @@ Failures are **classified**, because the right response differs and one generic
 | Rate limit *with* a retry hint | transient, not fatal — AI Studio's per-minute 429 says "billing" and "quota exceeded" but ends "retry in 18.5s" |
 | Quota/credits exhausted (no retry hint) | **fatal — no retry.** More requests cannot succeed |
 | Retired model (404) | fall back to the secondary model |
+| Model does not answer within `LLM_TIMEOUT_S` (60 s) | no retry of the model that stalled — one try on the secondary, then say so. google-genai has no timeout of its own, so without this a stalled call held the chat forever |
 | Cost over cap | reject and ask the user to narrow |
-| Permission error, lost credentials, network down | **end the turn and say so.** No rewrite fixes these, and handing them back spends the whole budget to fail again |
+| Permission error, lost credentials | **end the turn and say so.** No rewrite fixes these, and handing them back spends the whole budget to fail again |
+| BigQuery project out of quota (403 `quotaExceeded`) | end the turn and name it as quota — it used to be reported as refused credentials |
+| Warehouse unreachable | the client library's own retries are cut from 10 minutes to `BQ_API_RETRY_S` (10 s); when it gives up, that is an outage: counted by the breaker, never re-retried, and the turn says the warehouse is not responding |
 | Query timeout | cancel the job, then retry — an abandoned job keeps running and billing |
 
 Cost control: every query is **dry-run first** and rejected before execution if
@@ -407,6 +425,12 @@ on the real job as a second ceiling. A circuit breaker stops a BigQuery outage
 from becoming a cost incident — it counts dry-run failures too, since the dry
 run is the first call of every query and so the first thing an outage takes
 down. A per-turn model-call budget caps any loop.
+
+Neither SDK bounds its own waits, so every call does it explicitly. Measured
+against a dead BigQuery endpoint before that, one question hung for **19
+minutes** and then failed with an error nothing could classify; it now fails in
+about 10 seconds, named, and counted by the breaker. Both bounds have contract
+tests that drive the real client libraries at a local dead endpoint.
 Result sets are row-capped before entering the prompt.
 
 Empty results are reported as empty, never as zero — the model is explicitly
@@ -420,16 +444,19 @@ One append-only JSONL event stream per turn (`var/traces/`), carrying
 `trace_id` / `span_id` / `parent_span_id` — the OpenTelemetry span shape without
 the dependency, so production export to Cloud Trace changes no call sites.
 
-Per-turn metrics: model calls and errors, prompt/output tokens, tool calls, SQL
-attempts, guard rejections, self-corrections, bytes billed, empty results, PII
-redactions, refusals, retries, fallback-model use. *Refusals* are the policy
+Per-turn metrics: model calls and errors, prompt/output tokens, thinking tokens,
+tool calls, SQL attempts, guard rejections, self-corrections, bytes billed and
+bytes processed, empty results, PII redactions, refusals, retries, fallback-model
+use. Thinking tokens are billed as output but reported separately by Gemini, and
+can outnumber the answer's own; bytes billed is what BigQuery charges (a 10 MB
+minimum per table), not what it scanned. *Refusals* are the policy
 saying no — a PII, whole-row, write or out-of-dataset query, or a deletion that
 named nothing to match — kept apart from guard rejections of merely malformed
 SQL, because someone probing and a model fumbling are different alerts. The CLI
 prints the turn's figures under every answer:
 
 ```
-[status=ok llm=2 sql=1 corrections=0 tok=5424->605 bytes=8,674,709 trace=e8994d14bda540d1]
+[status=ok llm=2 sql=1 corrections=0 tok=5356->613 think=761 bytes=20,971,520 trace=50e90dd644e04e83]
 ```
 
 `/trace` lists recent turns; `/trace <id>` replays the full correspondence for
@@ -460,7 +487,7 @@ stack I chose is:
 | SQL policy | **sqlglot 30.x** | Parses every generated query to an AST, validates it, and *rewrites* it for entitlements. This is where the real framework work happens |
 | Orchestration | ~120 lines in `retail_agent/agent.py` | plan → guard → execute → observe → answer, written out explicitly |
 | Front end | **Rich** (CLI, required) / **Streamlit** (optional web) | Two renderers over one `dispatch.py` |
-| Verification | **pytest** | 213 tests, offline, no credentials |
+| Verification | **pytest** | 248 tests, offline, no credentials |
 
 The one-line version: **I put the framework where the risk is — in the SQL
 layer — and kept the control flow as plain code.** In a system whose hard
@@ -566,7 +593,7 @@ long-running workflows, I would have chosen LangGraph and said so.
 ## Testing
 
 ```bash
-pytest                      # 213 tests, no credentials required
+pytest                      # 248 tests, no credentials required
 pytest tests/test_safety.py -v
 pytest tests/test_demo.py -v            # the offline demo, end to end
 pytest tests/test_streamlit_ui.py -v    # skipped unless the web UI is installed

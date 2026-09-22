@@ -81,11 +81,16 @@ class TurnMetrics:
     llm_errors: int = 0
     prompt_tokens: int = 0
     output_tokens: int = 0
+    # Billed as output, reported separately by the API (see LLMResponse).
+    thinking_tokens: int = 0
     tool_calls: int = 0
     sql_attempts: int = 0
     sql_rejections: int = 0
     sql_self_corrections: int = 0
+    # What BigQuery charges, which is not what it scans: a 10 MB minimum per
+    # table referenced, and nothing at all for a cache hit.
     bq_bytes_billed: int = 0
+    bq_bytes_processed: int = 0
     empty_results: int = 0
     pii_redactions: int = 0
     # Requests the code refused on policy grounds: a PII, whole-row, write or

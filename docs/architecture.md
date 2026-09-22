@@ -16,7 +16,8 @@ promise a regulator.
 flowchart TB
     subgraph clients["Clients"]
         CLI["CLI chat<br/><i>this prototype</i>"]
-        WEB["Web / Slack<br/><i>future</i>"]
+        WEB["Web UI — Streamlit<br/><i>this prototype, optional</i>"]
+        SLACK["Slack<br/><i>future</i>"]
     end
 
     subgraph edge["Edge"]
@@ -28,7 +29,7 @@ flowchart TB
         ORCH["Agent orchestrator<br/>plan → tool → observe → answer"]
         GUARD["Safety layer<br/>sqlglot validation<br/>entitlement rewriting<br/>PII enforcement"]
         CONF["Confirmation broker<br/>propose → confirm → execute"]
-        TOOLS["Tool registry<br/>sql · reports · schema<br/>charts · email · web"]
+        TOOLS["Tool registry<br/>sql · reports · schema<br/><i>future: charts · email · web</i>"]
     end
 
     subgraph intelligence["Intelligence"]
@@ -53,6 +54,7 @@ flowchart TB
 
     CLI --> IAP
     WEB --> IAP
+    SLACK --> IAP
     IAP --> API --> ORCH
 
     ORCH <--> GEM
@@ -87,7 +89,7 @@ flowchart TB
 | Concern | Choice | Reasoning |
 |---|---|---|
 | Compute | **Cloud Run** | Request-shaped, bursty, scales to zero. A chat turn is seconds of CPU; GKE's operational weight buys nothing here. |
-| Model | **Gemini 3.6 Flash**, fallback **3.1 Flash-Lite** | Verified live on 2026-09-18; 2.5-* are retired for new keys and the API redirects to 3.6. Flash is the right tier for SQL generation and summarisation; Pro is reserved for multi-step "why" analyses if eval justifies the cost. |
+| Model | **Gemini 3.6 Flash**, fallback **3.1 Flash-Lite** | Verified live on 2026-09-18; 2.5-* are retired for new keys and the API redirects to 3.6. Flash is the right tier for SQL generation and summarisation; Pro is reserved for multi-step "why" analyses if eval justifies the cost. Temperature is left at the model's default of 1.0, as Google's Gemini 3 guidance recommends — lower values can make it loop. |
 | Model access | **Vertex AI via ADC**, not an AI Studio key | Access becomes IAM rather than a bearer secret — no key to mint, store, rotate or leak, and the workload already needs those credentials for BigQuery. It also bills through the project rather than a prepaid pool that fails closed on every model at once, which is precisely what happened to this project's AI Studio key mid-build. |
 | Warehouse | **BigQuery** | The dataset is already there; separation of storage and compute means per-query cost caps are enforceable server-side. |
 | Access control | **Authorized views + row-level access policies** | Moves entitlements *into* the database. The agent then cannot over-read even if the application layer is compromised. |
@@ -109,15 +111,20 @@ flowchart TB
    itself cannot leak another division's analysis.
 4. **Assemble the prompt.** Role → today's date, schema + metric glossary →
    retrieved trios → user preferences → persona → **safety contract last**
-   (see §3.8). Later layers take precedence, so preferences shape format, the
-   persona sets tone, and neither can outrank the safety contract.
+   (see §3.8). Later layers take precedence, so neither preferences nor the
+   persona can outrank the safety contract. The intent is that preferences shape
+   format and the persona sets tone — but the persona also carries format
+   defaults and sits later, which today lets it outrank a user's format
+   preference (§6).
 5. **Plan.** Gemini responds with prose or a tool call.
 6. **Guard.** For `run_analysis_sql`: parse, validate, rewrite for entitlements.
    A rejection returns a model-readable reason rather than an exception.
 7. **Cost-gate.** Dry run; reject over cap; execute with `maximum_bytes_billed`.
 8. **Sanitise.** Scrub PII from the result, cap rows, then return to the model.
-9. **Iterate.** Self-correctable failures return to step 5, bounded to 3 repairs
-   and a per-turn call budget.
+9. **Iterate.** Failures a different query could fix — SQL errors, guard
+   rejections, cost rejections, unknown tables — return to step 5, bounded to 3
+   repairs and a per-turn budget of 8 model calls. Infrastructure failures end
+   the turn instead (§3.5).
 10. **Compose and scrub.** The final answer is PII-scrubbed before display.
 11. **Record.** Spans, metrics and audit events are emitted throughout; the turn
     is a candidate for the learning loop (§3.4).
@@ -125,6 +132,14 @@ flowchart TB
 Destructive requests divert at step 5: `propose_delete_reports` resolves a match
 set and returns a confirmation prompt. Execution happens only on the *next* user
 message, in code, after the confirmation broker validates it.
+
+**What the prototype runs.** Steps 5–10 as described, and step 11's spans,
+metrics and audit events. The rest is production design: identity is a
+`--user` flag or the Streamlit sidebar, not SSO (step 1); there is no screen
+before the model (step 2) — the model declines out-of-scope questions under the
+safety contract, and the guard enforces what the contract cannot; there is no
+retrieval (step 3); and the prompt has no trios and an empty preferences slot
+(step 4).
 
 ---
 
@@ -211,8 +226,19 @@ Implemented — see the README for the enforced rules. Production additions:
 Implemented. The design point worth restating: strictness is proportional to
 blast radius, and **soft deletion is what makes a friendly confirmation tier
 defensible**. Above three reports a bare "yes" is answered with the count to
-type rather than taken, and the proposal stays open. In production, deletions of 25+ reports additionally require a
-second approver, and Firestore TTL purges soft-deleted rows after 30 days.
+type rather than taken, and the proposal stays open. The 30-day window is
+reachable from any later session (`/reports deleted`, `/undo <id>`), not only
+from the one that deleted. A match set is resolved against the caller's own
+library only — counting other users' matches, even without naming them, let
+anyone test what another executive's reports say. In production, deletions of
+25+ reports additionally require a second approver, and Firestore TTL purges
+soft-deleted rows after 30 days.
+
+Two prototype shortcuts. A pending proposal lives in process memory, so a
+restart discards it — which fails safe, since nothing is deleted — where
+production keeps it in Firestore. And nothing purges: `ReportStore.purge()`
+exists and is tested, but no job runs it, so soft-deleted rows outlive their
+30-day window until it is called by hand.
 
 ### 3.4 Continuous improvement
 
@@ -221,8 +247,10 @@ second approver, and Firestore TTL purges soft-deleted rows after 30 days.
 default, favourite metrics and comparison windows. Two write paths — explicit
 ("always give me tables") applied immediately, and inferred, which requires the
 same signal three times before it sticks and is always visible and revocable via
-`/preferences`. Inferring silently from one interaction produces an assistant
-that behaves inexplicably differently week to week.
+a `/preferences` command. Inferring silently from one interaction produces an
+assistant that behaves inexplicably differently week to week. None of this is
+built yet: the prototype has the prompt slot (`Agent.preferences`, rendered
+above the persona) and nothing that fills it — no store, no command.
 
 **System level.** Four loops, in increasing order of autonomy:
 
@@ -243,8 +271,9 @@ regional Cloud Run failover, a fallback from the `global` Vertex AI endpoint to
 a regional one for provider-level outages, request hedging on p99 latency, and
 idempotency keys so a retried report-save cannot duplicate.
 
-**Two failure modes worth recording, because both were invisible to a fully
-green test suite and only appeared against live services.**
+**Three failure modes worth recording, because all three were invisible to a
+fully green test suite: the first two appeared only against live services, the
+third only against the real client libraries.**
 
 *Thought signatures.* Gemini 3.x returns an opaque `thought_signature` on each
 function-call part and requires it echoed back verbatim when that call appears in
@@ -262,12 +291,31 @@ configuration, and the missing signature above. Each would have spent the turn's
 entire budget re-sending a request that could never succeed. The rule adopted:
 **a 400 that is about our request rather than the model's SQL is fatal** — a
 400 from the model API, or a BigQuery job-configuration 400, is never retried,
-never sent to a fallback model, never handed to the LLM as "fix your SQL". The
-one 400 that *is* handed back is a BigQuery error in the SQL itself (a syntax
-error, an unknown column), because a rewrite can fix exactly that — bounded to
-3 repairs. Retries are reserved for 5xx, timeouts and rate limits.
+never sent to a fallback model, never handed to the LLM as "fix your SQL".
+Every other BigQuery 400 *is* handed back, bounded to 3 repairs: an error in the
+SQL itself (a syntax error, an unknown column), and a query that hit the
+`maximum_bytes_billed` ceiling, because a rewrite or a narrower query can fix
+those. A job-configuration 400 is recognised by its message (`job.configuration`,
+`Invalid value at …`), and an unrecognised 400 defaults to "the SQL's fault" —
+so a new kind of request error would still reach the model, but only until the
+repair bound stops it. Retries are reserved for 5xx, rate limits and, for
+BigQuery, timeouts; a model that times out is never retried, since each retry
+costs another full timeout, and the fallback model gets one try instead.
 Misclassifying here is how a self-correction loop quietly becomes a cost
 incident, which is the exact failure Requirement 5 warns about.
+
+*The SDKs' own defaults.* Neither client library bounds its waits the way this
+design assumes. google-genai sets no request timeout, so a model endpoint that
+accepts a connection and stalls holds the chat indefinitely. google-cloud-bigquery
+retries for up to 10 minutes per call and re-runs failed jobs for up to 40,
+underneath the classifier and the breaker. Measured against a dead endpoint, a
+query hung for 19 minutes, surfaced as an unclassifiable `RetryError`, and the
+breaker never counted it. Every call now carries an explicit bound — a 60 s
+model timeout with no retry of the model that stalled, and a 10 s library retry
+budget for BigQuery — and a `RetryError` is classified as the outage it is.
+Both are covered by contract tests that drive the real client libraries
+against a local dead endpoint, because a fake client has no defaults to get
+wrong.
 
 ### 3.6 Quality assurance
 
@@ -308,17 +356,25 @@ Implemented in prototype form. Metrics to alert on, at the agent level:
 | Self-correction depth | model degradation | mean > 1.5 |
 | Guard rejection rate | injection or prompt drift | spike over baseline |
 | Refusals (policy blocks: PII, whole-row, write, unselective delete) | someone probing, as distinct from the model fumbling SQL | any spike, per user |
-| PII redaction count at output | **should be ~0**; non-zero means a layer failed | any sustained non-zero |
+| PII redactions | **should be ~0**; non-zero means an earlier layer let something through | any sustained non-zero |
 | p95 latency | UX | > 45 s |
-| Tokens & bytes billed per turn | cost | > 2× 7-day baseline |
+| Tokens (incl. thinking) & bytes billed per turn | cost — Gemini 3's thinking tokens are billed as output but reported separately, and can outnumber the answer's by 10× | > 2× 7-day baseline |
 | Quota/circuit events | dependency health | any |
 | Empty-result rate | question/data mismatch | > 15% |
 
-Deep-dive: every turn has a trace id shown to the user on failure. `/trace <id>`
-(and Cloud Trace in production) replays the whole correspondence — prompts, tool
-calls, generated SQL, rewritten SQL, errors, retries, tokens. Logs export to
-BigQuery, so "which questions failed most this month" is a query, and the same
-table feeds the learning loop.
+The prototype keeps one `pii_redactions` counter across query results, saved
+reports and the final answer; which layer caught a redaction is in each
+`audit.pii_redacted` event's `where` field. Production should alert per layer.
+
+Deep-dive: every answer carries its trace id — the CLI prints it under each turn
+with that turn's counters. `/trace <id>` (and Cloud Trace in production) replays
+the correspondence — the assembled prompt, tool calls, generated SQL, rewritten
+SQL, errors, retries, tokens — and only for the caller's own turns. The
+prototype cuts each text field to 2,000 characters by default, so the system
+prompt arrives as a snippet plus a SHA-256 digest that still identifies it
+exactly; `TRACE_FULL_MESSAGES=1` keeps bodies whole. Logs export to BigQuery, so
+"which questions failed most this month" is a query, and the same table feeds
+the learning loop.
 
 ### 3.8 Agility — persona management
 
@@ -339,7 +395,11 @@ breaks silently.
 
 ## 4. Extensibility
 
-New capabilities are tools; the orchestrator does not change.
+New capabilities are tools. In the prototype a tool is a `TOOL_DECLARATIONS`
+entry plus one branch in the agent loop's tool dispatch — about a dozen lines in
+two places; the loop's control flow, the guard and the confirmation broker stay
+as they are. A name-to-handler registry would remove the branch as well, and is
+worth doing once there are more than a handful of tools.
 
 - **Charts** — a `render_chart` tool returning a Vega-Lite spec, rendered by the
   client. Specs rather than images keeps the payload small and the rendering
@@ -349,10 +409,16 @@ New capabilities are tools; the orchestrator does not change.
   egress control here.
 - **Web search for trends** — a grounding tool whose results are fenced as
   untrusted data, never blended into the analysis without attribution.
-- **New data sources** — add a catalog entry, a PII registry entry, the scope
-  predicate, and glossary definitions. The guard's allowlist and rewriting rules
-  are table-driven, so a new table is configuration plus tests, not new
-  enforcement code.
+- **New data sources** — today a new table touches Python in four places: the
+  catalog entry (`catalog.py`), the PII registry (`safety/pii.py`), the guard's
+  allowlist, and a scoping branch in `_scoped_subquery_sql` that spells out how
+  the table reaches `products` (`safety/sql_guard.py`) — plus glossary
+  definitions in `metrics.yaml`, and a source outside `thelook_ecommerce` also
+  needs the guard's single-dataset check widened. The scoping branch is
+  enforcement code and needs its own tests. It fails closed: a table on the
+  allowlist without one is rejected for every scoped user. Moving the allowlist,
+  PII registry and join paths into one config file is what would make a new
+  table configuration plus tests — the production target, not the current state.
 
 ---
 
@@ -360,13 +426,17 @@ New capabilities are tools; the orchestrator does not change.
 
 | Concern | Prototype | Production |
 |---|---|---|
+| Front ends | CLI + optional Streamlit UI, one shared `dispatch.py` | Web app and Slack behind IAP, same dispatch contract |
 | Entitlements | sqlglot rewriting in-process | + authorized views, RLS |
-| Reports | SQLite | Firestore + TTL |
+| Reports | SQLite, soft delete; purge exists but nothing runs it | Firestore + TTL |
+| Pending deletions | in process memory; a restart discards them | Firestore |
 | Sessions | in-memory, trimmed | Firestore, summarised |
 | Persona | YAML on disk | Firestore + admin UI |
+| Preferences | prompt slot only; nothing fills it | Firestore, explicit + inferred (§3.4) |
+| Pre-model screening | none — the model declines under the safety contract | classifier before any model spend |
 | Golden Bucket | not implemented | GCS + Vector Search |
 | Traces | JSONL on disk | Cloud Trace + Logging → BigQuery |
-| Auth | `--user` flag | Workspace SSO via IAP |
+| Auth | `--user` flag or Streamlit sidebar; no real authentication | Workspace SSO via IAP |
 | Secrets | `.env` | Secret Manager |
 
 ---
@@ -382,3 +452,10 @@ New capabilities are tools; the orchestrator does not change.
 - Conversation history is dropped rather than summarised past 12 turns.
 - Cost caps are per query, not per user per day; a budget ledger in Firestore is
   the natural next step.
+- Prompt layering has one unresolved conflict. `persona.yaml` carries format
+  defaults (`default_format`, `max_words_per_answer`) as well as tone, and the
+  persona renders after the preferences slot — so a persona format rule would
+  outrank a user's "always give me tables". It is latent while nothing fills
+  preferences; before that lands, either the persona's format fields move above
+  the preferences slot, or preferences render after the persona's style rules
+  but still above the safety contract.

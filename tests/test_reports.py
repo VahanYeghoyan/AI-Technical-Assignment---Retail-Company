@@ -59,7 +59,20 @@ def test_save_and_get_roundtrip(store):
 
 def test_resolve_short_id(store):
     report = make_report(store)
-    assert store.resolve_id(report.report_id[:8]).report_id == report.report_id
+    assert store.resolve_id(report.report_id[:8], owner="maya").report_id == (
+        report.report_id
+    )
+    # Pasted straight from a listing, brackets and all.
+    assert store.resolve_id(f"[{report.report_id[:8]}]", owner="maya") is not None
+
+
+def test_resolve_short_id_is_scoped_to_the_owner_and_literal(store):
+    # Unscoped, a short id answered "does anyone have a report starting with
+    # this?" — and a bare % matched the first row of anyone's library.
+    theirs = make_report(store, owner="daniel")
+    assert store.resolve_id(theirs.report_id[:8], owner="maya") is None
+    assert store.resolve_id("%", owner="maya") is None
+    assert store.resolve_id("", owner="daniel") is None
 
 
 def test_list_excludes_deleted_by_default(store):
@@ -111,6 +124,21 @@ def test_restore_refuses_other_users_reports(store):
     assert store.restore([theirs.report_id], actor="maya") == ()
 
 
+def test_restorable_lists_only_the_owners_deletions_inside_the_window(store):
+    recent = make_report(store, title="recent")
+    stale = make_report(store, title="stale")
+    live = make_report(store, title="live")  # noqa: F841 - never deleted
+    theirs = make_report(store, owner="daniel", title="theirs")
+    store.delete([recent.report_id, stale.report_id], actor="maya")
+    store.delete([theirs.report_id], actor="daniel")
+    old = (datetime.now(UTC) - timedelta(days=31)).isoformat(timespec="seconds")
+    store._conn.execute(
+        "UPDATE reports SET deleted_at = ? WHERE report_id = ?", (old, stale.report_id)
+    )
+
+    assert [r.title for r in store.list_restorable("maya")] == ["recent"]
+
+
 def test_purge_hard_deletes_only_expired(store):
     fresh = make_report(store)
     store.delete([fresh.report_id], actor="maya")
@@ -135,12 +163,12 @@ def test_search_matches_title_body_and_entities(store):
     assert len(store.search(actor="maya", text="Acme")) == 3
 
 
-def test_search_is_scoped_to_the_actor_by_default(store):
+def test_search_is_always_scoped_to_the_actor(store):
     make_report(store, owner="maya", title="Acme")
     make_report(store, owner="daniel", title="Acme")
 
-    assert len(store.search(actor="maya", text="Acme")) == 1
-    assert len(store.search(actor="maya", text="Acme", owned_only=False)) == 2
+    assert [r.owner for r in store.search(actor="maya", text="Acme")] == ["maya"]
+    assert [r.owner for r in store.search(actor="daniel", text="Acme")] == ["daniel"]
 
 
 def test_search_by_conversation(store):
@@ -247,16 +275,35 @@ def test_expired_proposal_is_not_confirmable(store, broker):
         broker.confirm("maya")
 
 
-def test_proposal_reports_matches_owned_by_others(store, broker):
-    make_report(store, owner="maya", title="Acme mine")
-    make_report(store, owner="daniel", title="Acme theirs")
+def test_proposal_reveals_nothing_about_other_users_reports(store, broker):
+    # The prompt used to add "(1 report(s) match but belong to someone else)",
+    # which made deletion a search of every library: Sam could confirm, one
+    # guess at a time, what the CEO's private reports say.
+    make_report(store, owner="ceo", title="Board prep",
+                body="Plan to exit the Levi's contract in Q4")
 
-    pending = broker.propose_deletion(
-        actor="maya", criteria="mentioning Acme", text="Acme"
+    hit = broker.propose_deletion(
+        actor="sam", criteria="mentioning exit the Levi's contract",
+        text="exit the Levi's contract",
     )
-    assert len(pending.targets) == 1
-    assert len(pending.not_owned) == 1
-    assert "belong to someone else" in pending.prompt()
+    miss = broker.propose_deletion(
+        actor="sam", criteria="mentioning exit the Levi's contract",
+        text="exit the Wrangler contract",
+    )
+
+    assert hit.targets == ()
+    # Indistinguishable from a guess that matches nothing anywhere.
+    assert hit.prompt() == miss.prompt()
+    assert "someone else" not in hit.prompt()
+
+
+def test_proposal_by_id_cannot_reach_another_users_report(store, broker):
+    theirs = make_report(store, owner="daniel", title="Acme")
+    pending = broker.propose_deletion(
+        actor="maya", criteria="that one", report_ids=[theirs.report_id[:8]]
+    )
+    assert pending.targets == ()
+    assert broker.pending_for("maya") is None
 
 
 def test_empty_match_set_does_not_arm_a_confirmation(store, broker):

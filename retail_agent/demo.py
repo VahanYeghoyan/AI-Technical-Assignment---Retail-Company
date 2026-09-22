@@ -72,6 +72,15 @@ _SELECTOR_RE = re.compile(
     r"[\"'“]?(?P<text>[^\"'”?.!]+)",
     re.IGNORECASE,
 )
+# What a report is about: "a report on denim", "a report for Q3 with actions".
+# The README's own example is "create a report on denim", which the selector
+# pattern above does not match, so it was saved as "this quarter" and a
+# follow-up "delete reports mentioning denim" found nothing.
+_TOPIC_RE = re.compile(
+    r"\breport\s+(?:on|about|for|covering|mentioning)\s+[\"'“]?"
+    r"(?P<text>[^\"'”?.!,]+?)(?=\s+(?:with|including|and)\b|[\"'”?.!,]|$)",
+    re.IGNORECASE,
+)
 
 
 def demo_responder(system: str, contents: list[dict[str, Any]]) -> LLMResponse:  # noqa: ARG001
@@ -119,7 +128,7 @@ def _deletion_args(question: str) -> dict[str, Any]:
 
 
 def _report_args(question: str) -> dict[str, Any]:
-    topic = _SELECTOR_RE.search(question)
+    topic = _TOPIC_RE.search(question) or _SELECTOR_RE.search(question)
     subject = topic.group("text").strip() if topic else "this quarter"
     sections = report_sections() or ("summary", "action_items")
     placeholder = {

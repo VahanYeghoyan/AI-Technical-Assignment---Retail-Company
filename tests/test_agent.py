@@ -21,6 +21,7 @@ from retail_agent.llm import (
     FunctionCall,
     LLMQuotaError,
     LLMResponse,
+    LLMTimeoutError,
     LLMTransientError,
     StubProvider,
 )
@@ -416,6 +417,45 @@ def test_a_warehouse_outage_is_named_as_such(tmp_path, store):
     assert history_faults(agent.history) == []
 
 
+def test_an_exhausted_bigquery_quota_is_named_as_such(tmp_path, store):
+    from google.api_core import exceptions as gexc
+
+    spent = gexc.Forbidden(
+        "Quota exceeded: Your project exceeded quota for free query bytes scanned.",
+        errors=[{"reason": "quotaExceeded"}],
+    )
+    agent = build(
+        tmp_path,
+        store,
+        [call("run_analysis_sql", sql="SELECT COUNT(*) AS n FROM orders")] * 10,
+        bq_client=FakeBQClient(behaviours=[spent] * 10),
+    )
+
+    result = agent.ask("how many orders?")
+
+    assert result.status == "warehouse_quota"
+    assert "quota" in result.answer
+    assert "credentials" not in result.answer
+    assert agent.tracer.metrics.llm_calls == 1
+
+
+def test_a_warehouse_the_client_gave_up_on_is_named_as_unavailable(tmp_path, store):
+    from google.api_core import exceptions as gexc
+
+    gave_up = gexc.RetryError("Timeout of 10.0s exceeded", ConnectionError("down"))
+    agent = build(
+        tmp_path,
+        store,
+        [call("run_analysis_sql", sql="SELECT COUNT(*) AS n FROM orders")] * 10,
+        bq_client=FakeBQClient(behaviours=[gave_up] * 10),
+    )
+
+    result = agent.ask("how many orders?")
+
+    assert result.status == "warehouse_unavailable"
+    assert "not responding" in result.answer
+
+
 def test_the_model_sees_every_row_the_runner_kept(tmp_path, store):
     # The rendering cap was 20 while the runner's cap was 200, so a 50-row
     # answer was written from the first 20 rows — with truncated=False, because
@@ -492,6 +532,20 @@ def test_llm_outage_degrades_without_crashing(tmp_path, store):
 
     assert result.status == "llm_unavailable"
     assert "reports are unaffected" in result.answer
+
+
+def test_a_model_timeout_is_named_as_such(tmp_path, store):
+    class Stalled(StubProvider):
+        def generate(self, **kwargs):
+            raise LLMTimeoutError("the model did not answer in time")
+
+    agent = build(tmp_path, store, [])
+    agent.provider = Stalled()
+
+    result = agent.ask("what was revenue?")
+
+    assert result.status == "llm_timeout"
+    assert "did not respond in time" in result.answer
 
 
 def test_unexpected_error_still_returns_a_trace_id(tmp_path, store):
@@ -700,6 +754,44 @@ def test_a_plain_yes_to_a_bulk_delete_asks_for_the_count_again(tmp_path, store):
     assert store.list_for_user("maya") == ()
 
 
+@pytest.mark.parametrize("reply", ["no", "No.", "never mind", "Cancel!"])
+def test_a_plain_no_cancels_without_a_model_call(tmp_path, store, reply):
+    store.save(owner="maya", conversation_id="conv-1", title="Acme review", body="x")
+    agent = build(
+        tmp_path,
+        store,
+        [call("propose_delete_reports", criteria="mentioning Acme", text="Acme")],
+    )
+    agent.ask("delete reports mentioning Acme")
+    calls_before = len(agent.provider.requests)
+
+    outcomes = dispatch(agent, reply)
+
+    assert [o.kind for o in outcomes] == [Kind.CANCELLED]
+    assert len(agent.provider.requests) == calls_before
+
+
+def test_a_slash_command_leaves_a_pending_deletion_pending(tmp_path, store):
+    # Checking /reports before saying yes is the careful thing to do; it used
+    # to cancel the proposal being checked.
+    report = store.save(
+        owner="maya", conversation_id="conv-1", title="Acme review", body="x"
+    )
+    agent = build(
+        tmp_path,
+        store,
+        [call("propose_delete_reports", criteria="mentioning Acme", text="Acme")],
+    )
+    agent.ask("delete reports mentioning Acme")
+
+    [listing] = dispatch(agent, "/reports")
+    assert listing.kind is Kind.REPORTS
+
+    [deleted] = dispatch(agent, "yes")
+    assert deleted.kind is Kind.DELETED
+    assert store.get(report.report_id).is_deleted is True
+
+
 def test_undo_restores_after_confirmed_delete(tmp_path, store):
     report = store.save(
         owner="maya", conversation_id="conv-1", title="Acme review", body="x"
@@ -714,6 +806,43 @@ def test_undo_restores_after_confirmed_delete(tmp_path, store):
     cli.handle_input(agent, "/undo")
 
     assert store.get(report.report_id).is_deleted is False
+
+
+def test_a_deletion_can_be_restored_from_a_later_session(tmp_path, store):
+    # The prompt promises 30 days of restore, but /undo only remembered the
+    # last batch in memory: after a restart it restored nothing, and nothing
+    # else could.
+    report = store.save(
+        owner="maya", conversation_id="conv-1", title="Acme review", body="x"
+    )
+    first = build(
+        tmp_path,
+        store,
+        [call("propose_delete_reports", criteria="mentioning Acme", text="Acme")],
+    )
+    first.ask("delete reports mentioning Acme")
+    dispatch(first, "yes")
+
+    later = build(tmp_path, store, [])  # a new session: no memory of the batch
+    [nothing] = dispatch(later, "/undo")
+    assert nothing.restored == ()
+
+    [listing] = dispatch(later, "/reports deleted")
+    assert [r.report_id for r in listing.reports] == [report.report_id]
+
+    [undone] = dispatch(later, f"/undo {report.report_id[:8]}")
+    assert [r.report_id for r in undone.restored] == [report.report_id]
+    assert store.get(report.report_id).is_deleted is False
+
+
+def test_undo_by_id_cannot_restore_another_users_report(tmp_path, store):
+    theirs = store.save(owner="daniel", conversation_id="c", title="Acme", body="x")
+    store.delete([theirs.report_id], actor="daniel")
+
+    [undone] = dispatch(build(tmp_path, store, []), f"/undo {theirs.report_id[:8]}")
+
+    assert undone.restored == ()
+    assert store.get(theirs.report_id).is_deleted is True
 
 
 def test_deletion_is_audited(tmp_path, store):
@@ -815,6 +944,21 @@ def test_the_cli_shows_the_turns_telemetry_under_every_answer(tmp_path, store, c
     out = capsys.readouterr().out
     assert "[status=ok llm=2 sql=1 corrections=0 tok=100->20 bytes=1,000" in out
     assert f"trace={agent.tracer.trace_id}]" in out
+
+
+def test_the_telemetry_line_carries_thinking_tokens(tmp_path, store, capsys):
+    # Billed as output, reported apart from it: a live call spent 480 thinking
+    # tokens on a 28-token answer, and the line used to show only the 28.
+    thought = LLMResponse(
+        text="Revenue was $1.00.", model="stub",
+        prompt_tokens=100, output_tokens=20, thinking_tokens=300,
+    )
+    agent = build(tmp_path, store, [thought])
+
+    cli.handle_input(agent, "what was revenue?")
+
+    assert "tok=100->20 think=300 bytes=0" in capsys.readouterr().out
+    assert agent.tracer.metrics.thinking_tokens == 300
 
 
 # ---------------------------------------------------------------------------

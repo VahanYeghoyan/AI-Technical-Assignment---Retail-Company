@@ -22,6 +22,15 @@ but a lean client is not safe to put behind an LLM. Four things are added:
                     cooldown instead of retrying every call. This is what stops a
                     BigQuery outage from turning into a cost incident.
 
+  BOUNDED LIBRARY RETRIES  google-cloud-bigquery retries on its own, for up to
+                    10 minutes per call by default — underneath everything above.
+                    Measured against a dead endpoint, a query hung for 19 minutes
+                    before this module saw any error at all, and that error was
+                    unclassifiable, so the breaker never counted it. Every call
+                    now passes the library a short retry deadline (it still
+                    absorbs a blip) and no job-level retry (this module owns
+                    restarts); when the library gives up, that is an outage.
+
   RESULT HYGIENE    Results are PII-scrubbed and row-capped before they go
                     anywhere near the model's context.
 
@@ -56,6 +65,11 @@ DEFAULT_TIMEOUT_S = 60
 # Rows handed to the LLM. Executives ask for aggregates; a 10k-row answer is a
 # bug, and pasting it into the prompt is how context windows and bills explode.
 DEFAULT_MAX_ROWS = 200
+# How long the client library may keep retrying one API call before giving up
+# (its own default is 600 s), and how long any single HTTP request may take
+# (its own default is forever).
+DEFAULT_API_RETRY_S = 10.0
+API_REQUEST_TIMEOUT_S = 30.0
 
 
 class QueryErrorKind(StrEnum):
@@ -66,9 +80,11 @@ class QueryErrorKind(StrEnum):
     CONFIG = "config"            # OUR bug (bad job config); never self-correct
     COST = "cost_exceeded"       # ask the user to narrow the question
     PERMISSION = "permission"    # config problem; do not retry, surface to operator
+    QUOTA = "quota_exceeded"     # the PROJECT is out of BigQuery quota; not a login problem
     NOT_FOUND = "not_found"      # table/dataset missing
     TIMEOUT = "timeout"
     TRANSIENT = "transient"      # retry with backoff
+    UNAVAILABLE = "unavailable"  # the client library already retried and gave up
     CIRCUIT_OPEN = "circuit_open"
     UNKNOWN = "unknown"
 
@@ -86,6 +102,20 @@ class QueryError(Exception):
     @property
     def retryable(self) -> bool:
         return self.kind in {QueryErrorKind.TRANSIENT, QueryErrorKind.TIMEOUT}
+
+    @property
+    def indicates_outage(self) -> bool:
+        """Evidence the warehouse is unwell — what the circuit breaker counts.
+
+        Wider than retryable: UNAVAILABLE is not retried here, because the
+        client library has already spent its own retries on it, but it is the
+        clearest outage signal there is.
+        """
+        return self.kind in {
+            QueryErrorKind.TRANSIENT,
+            QueryErrorKind.TIMEOUT,
+            QueryErrorKind.UNAVAILABLE,
+        }
 
     @property
     def self_correctable(self) -> bool:
@@ -115,6 +145,7 @@ class QueryResult:
     dataframe: pd.DataFrame
     row_count: int
     bytes_processed: int
+    bytes_billed: int = 0
     truncated: bool = False
     redactions: tuple[str, ...] = ()
     scope_applied: bool = False
@@ -172,10 +203,26 @@ def _plain_table(frame: pd.DataFrame) -> str:
     return "\n".join([header, divider, *body])
 
 
+def _reason(err: Exception) -> str:
+    """BigQuery's machine-readable error reason, e.g. "quotaExceeded"."""
+    try:
+        return str(err.errors[0]["reason"])  # type: ignore[attr-defined]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return ""
+
+
 def _classify(err: Exception) -> QueryError:
     """Map a BigQuery exception onto a kind the agent can act on."""
     message = str(err)
     lowered = message.lower()
+
+    if isinstance(err, gexc.RetryError):
+        # The client library retried a transient failure until its deadline.
+        # Retrying again here would only multiply the wait.
+        return QueryError(
+            QueryErrorKind.UNAVAILABLE,
+            f"BigQuery did not respond: {message}",
+        )
 
     if isinstance(err, gexc.BadRequest):
         # Not every 400 is the model's fault. A malformed job configuration is
@@ -204,7 +251,22 @@ def _classify(err: Exception) -> QueryError:
             return QueryError(QueryErrorKind.COST, message)
         return QueryError(QueryErrorKind.SYNTAX, message, hint=message.split("\n")[0])
 
-    if isinstance(err, (gexc.Forbidden, gexc.Unauthorized)):
+    if isinstance(err, gexc.Forbidden):
+        # BigQuery answers 403 for three different things, and only one of them
+        # is about credentials. A sandbox project that has spent its free
+        # 1 TB/month was told its login was refused.
+        # The structured reason decides when there is one; the text only when
+        # there is not.
+        reason = _reason(err)
+        if reason == "rateLimitExceeded" or (
+            not reason and "exceeded rate limits" in lowered
+        ):
+            return QueryError(QueryErrorKind.TRANSIENT, message)
+        if reason == "quotaExceeded" or (not reason and "quota exceeded" in lowered):
+            return QueryError(QueryErrorKind.QUOTA, message)
+        return QueryError(QueryErrorKind.PERMISSION, message)
+
+    if isinstance(err, gexc.Unauthorized):
         return QueryError(QueryErrorKind.PERMISSION, message)
 
     # Credentials that cannot be obtained or refreshed, and raw transport
@@ -236,6 +298,7 @@ def _classify(err: Exception) -> QueryError:
             gexc.TooManyRequests,
             gexc.ServiceUnavailable,
             gexc.InternalServerError,
+            gexc.BadGateway,
             gexc.GatewayTimeout,
         ),
     ):
@@ -303,6 +366,7 @@ class BigQueryRunner:
         timeout_s: float | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
         max_attempts: int = 3,
+        api_retry_s: float | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.project_id = project_id or os.getenv("GOOGLE_CLOUD_PROJECT")
@@ -315,6 +379,9 @@ class BigQueryRunner:
         )
         self.max_rows = max_rows
         self.max_attempts = max_attempts
+        self.api_retry_s = float(
+            api_retry_s or os.getenv("BQ_API_RETRY_S") or DEFAULT_API_RETRY_S
+        )
         self._sleep = sleep
         self._client = client
         self._breaker = _CircuitBreaker()
@@ -385,7 +452,7 @@ class BigQueryRunner:
                 "than selecting detail rows.",
             )
 
-        dataframe, bytes_processed, total_rows = self._run_with_retries(
+        dataframe, bytes_processed, bytes_billed, total_rows = self._run_with_retries(
             guarded.sql, tracer=tracer, max_rows=self.max_rows
         )
 
@@ -406,18 +473,21 @@ class BigQueryRunner:
             dataframe=cleaned,
             row_count=row_count,
             bytes_processed=bytes_processed,
+            bytes_billed=bytes_billed,
             truncated=truncated,
             redactions=tuple(redactions),
             scope_applied=guarded.rewritten,
         )
         if tracer:
-            tracer.metrics.bq_bytes_billed += bytes_processed
+            tracer.metrics.bq_bytes_billed += bytes_billed
+            tracer.metrics.bq_bytes_processed += bytes_processed
             if result.is_empty:
                 tracer.metrics.empty_results += 1
             tracer.emit(
                 "bq.result",
                 rows=result.row_count,
-                bytes=bytes_processed,
+                bytes_processed=bytes_processed,
+                bytes_billed=bytes_billed,
                 truncated=truncated,
                 empty=result.is_empty,
             )
@@ -430,12 +500,18 @@ class BigQueryRunner:
         applies entitlements. Retained so existing scripts and notebooks that
         import this class keep working.
         """
-        dataframe, _, _ = self._run_with_retries(sql_query, tracer=None, max_rows=None)
+        dataframe, _, _, _ = self._run_with_retries(
+            sql_query, tracer=None, max_rows=None
+        )
         return dataframe
 
     def get_table_schema(self, table_name: str) -> list[dict[str, Any]]:
-        """Column metadata for one table (unchanged from the supplied runner)."""
-        table = self.client.get_table(f"{self.dataset_id}.{table_name}")
+        """Column metadata for one table (as in the supplied runner)."""
+        table = self.client.get_table(
+            f"{self.dataset_id}.{table_name}",
+            retry=self._api_retry(),
+            timeout=API_REQUEST_TIMEOUT_S,
+        )
         return [
             {
                 "name": field_.name,
@@ -447,6 +523,41 @@ class BigQueryRunner:
         ]
 
     # -- internals --------------------------------------------------------
+
+    def _api_retry(self) -> Any:
+        """The client library's own retry policy, cut to api_retry_s.
+
+        Still worth having — it absorbs a dropped connection mid-poll without
+        resubmitting the job, and job ids are generated client-side so a
+        retried insert cannot run twice — but bounded, so an outage reaches
+        this module's classification and breaker in seconds, not ten minutes.
+        """
+        from google.cloud.bigquery.retry import DEFAULT_RETRY
+
+        return DEFAULT_RETRY.with_timeout(self.api_retry_s)
+
+    def _submit(self, sql: str, *, dry_run: bool) -> Any:
+        """client.query() with every library-level wait bounded.
+
+        job_retry=None: the library would otherwise re-run a failed job for up
+        to 40 minutes. Restarting a job is this module's decision — it is what
+        the breaker and the cancel-before-retry rule exist to govern.
+        """
+        return self.client.query(
+            sql,
+            job_config=self._job_config(dry_run=dry_run),
+            retry=self._api_retry(),
+            timeout=API_REQUEST_TIMEOUT_S,
+            job_retry=None,
+        )
+
+    def _record(self, error: QueryError, *, counts_as_healthy: bool) -> None:
+        """Feed one failure to the circuit breaker."""
+        if error.indicates_outage:
+            self._breaker.record_failure(time.monotonic())
+        elif counts_as_healthy:
+            # BigQuery answered — with a no. The warehouse itself is up.
+            self._breaker.reset()
 
     def _job_config(self, *, dry_run: bool):
         from google.cloud import bigquery
@@ -477,7 +588,7 @@ class BigQueryRunner:
         have completed.
         """
         def attempt() -> int:
-            job = self.client.query(sql, job_config=self._job_config(dry_run=True))
+            job = self._submit(sql, dry_run=True)
             return int(getattr(job, "total_bytes_processed", 0) or 0)
 
         # A dry run is planning only: it keeps answering while the execution
@@ -510,12 +621,10 @@ class BigQueryRunner:
                 # property raises PERMISSION when credentials are missing);
                 # re-classifying it would demote that to UNKNOWN.
                 error = err if isinstance(err, QueryError) else _classify(err)
+                self._record(error, counts_as_healthy=counts_as_healthy)
                 if not error.retryable:
-                    if counts_as_healthy:
-                        self._breaker.reset()
                     raise error from err
                 last = error
-                self._breaker.record_failure(time.monotonic())
                 if tracer:
                     tracer.metrics.retries += 1
                     tracer.emit(
@@ -537,8 +646,8 @@ class BigQueryRunner:
 
     def _run_with_retries(
         self, sql: str, *, tracer: Tracer | None, max_rows: int | None
-    ) -> tuple[pd.DataFrame, int, int]:
-        """Run a query; returns (rows fetched, bytes processed, total row count).
+    ) -> tuple[pd.DataFrame, int, int, int]:
+        """Run a query; returns (rows, bytes processed, bytes billed, total rows).
 
         Only `max_rows` rows are downloaded. The cap used to be applied after
         the download, so a detail query pulled every row over REST — 180k
@@ -550,8 +659,13 @@ class BigQueryRunner:
             self._breaker.check(time.monotonic())
             job = None
             try:
-                job = self.client.query(sql, job_config=self._job_config(dry_run=False))
-                rows = job.result(timeout=self.timeout_s, max_results=max_rows)
+                job = self._submit(sql, dry_run=False)
+                rows = job.result(
+                    timeout=self.timeout_s,
+                    max_results=max_rows,
+                    retry=self._api_retry(),
+                    job_retry=None,
+                )
                 # REST download, not the Storage API. google-cloud-bigquery-
                 # storage is deliberately not a dependency (it pulls in gRPC),
                 # and result sets here are row-capped well below the size where
@@ -562,17 +676,17 @@ class BigQueryRunner:
                 total_rows = int(getattr(rows, "total_rows", None) or len(dataframe))
             except Exception as err:  # noqa: BLE001
                 error = err if isinstance(err, QueryError) else _classify(err)
-                if error.kind is QueryErrorKind.TIMEOUT:
+                if job is not None and error.indicates_outage:
                     # We stopped waiting; BigQuery did not stop working. Without
                     # this the retry submits a second job while the first one
                     # runs on and bills, so a slow query was charged up to three
-                    # times over for one answer.
+                    # times over for one answer — and giving up entirely left
+                    # the job running with nobody waiting for it.
                     _cancel_quietly(job, tracer)
+                self._record(error, counts_as_healthy=True)
                 if not error.retryable:
-                    self._breaker.reset()
                     raise error from err
                 last = error
-                self._breaker.record_failure(time.monotonic())
                 if tracer:
                     tracer.metrics.retries += 1
                     tracer.emit(
@@ -587,7 +701,13 @@ class BigQueryRunner:
             else:
                 self._breaker.reset()
                 bytes_processed = int(getattr(job, "total_bytes_processed", 0) or 0)
-                return dataframe, bytes_processed, total_rows
+                # What is actually charged: a 10 MB minimum per table
+                # referenced, and 0 for a cache hit. Fakes without the
+                # attribute fall back to the processed figure.
+                bytes_billed = int(
+                    getattr(job, "total_bytes_billed", bytes_processed) or 0
+                )
+                return dataframe, bytes_processed, bytes_billed, total_rows
 
         assert last is not None
         raise last
