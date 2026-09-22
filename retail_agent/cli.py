@@ -59,7 +59,8 @@ Ask about sales, products, customers or performance. Type /help for commands.
 HELP = """\
 [bold]Commands[/bold]
   /reports            list your saved reports
-  /undo               restore the reports deleted most recently
+  /reports deleted    deleted reports you can still restore (30 days)
+  /undo [id]          restore the reports just deleted, or one by its id
   /trace [id]         recent turns, or the full event trace for one turn
   /whoami             your identity, scope and the active persona version
   /persona            reload and show the current persona (edit config/persona.yaml)
@@ -89,19 +90,30 @@ def build_agent(user_id: str, *, conversation_id: str) -> Agent:
 # -- rendering ------------------------------------------------------------
 
 
-def _render_reports(reports: tuple) -> None:
+def _render_reports(reports: tuple, *, deleted: bool = False) -> None:
     if not reports:
-        console.print("[dim]No saved reports yet.[/dim]")
+        console.print(
+            "[dim]No deleted reports to restore.[/dim]"
+            if deleted
+            else "[dim]No saved reports yet.[/dim]"
+        )
         return
-    table = Table(title="Saved reports", header_style="bold")
+    table = Table(
+        title="Deleted reports (restorable)" if deleted else "Saved reports",
+        header_style="bold",
+    )
     table.add_column("id")
     table.add_column("title")
-    table.add_column("created")
+    table.add_column("deleted" if deleted else "created")
     for report in reports:
         table.add_row(
-            report.report_id[:8], _safe(report.title), report.created_at[:10]
+            report.report_id[:8],
+            _safe(report.title),
+            (report.deleted_at if deleted else report.created_at)[:10],
         )
     console.print(table)
+    if deleted:
+        console.print("[dim]/undo <id> restores one.[/dim]")
 
 
 def _render_trace_events(outcome: Outcome) -> None:
@@ -157,12 +169,16 @@ def telemetry_line(outcome: Outcome) -> str:
     """
     result, metrics = outcome.result, outcome.metrics
     assert result is not None
+    # Gemini 3's reasoning tokens are billed as output but reported apart from
+    # it, so they get their own figure rather than hiding inside tok=.
+    thinking = metrics.get("thinking_tokens", 0)
     return (
         f"[status={result.status} llm={metrics.get('llm_calls', 0)} "
         f"sql={metrics.get('sql_attempts', 0)} "
         f"corrections={metrics.get('sql_self_corrections', 0)} "
         f"tok={metrics.get('prompt_tokens', 0)}->{metrics.get('output_tokens', 0)} "
-        f"bytes={metrics.get('bq_bytes_billed', 0):,} trace={result.trace_id}]"
+        + (f"think={thinking} " if thinking else "")
+        + f"bytes={metrics.get('bq_bytes_billed', 0):,} trace={result.trace_id}]"
     )
 
 
@@ -202,13 +218,20 @@ def render(agent: Agent, outcome: Outcome) -> None:
     elif outcome.kind is Kind.HELP:
         console.print(HELP)
     elif outcome.kind is Kind.REPORTS:
-        _render_reports(outcome.reports)
+        _render_reports(outcome.reports, deleted=outcome.text == "deleted")
     elif outcome.kind is Kind.UNDO:
-        console.print(
-            f"[green]Restored {len(outcome.restored)} report(s).[/green]"
-            if outcome.restored
-            else "[yellow]Nothing to restore.[/yellow]"
-        )
+        if outcome.restored:
+            console.print(f"[green]Restored {len(outcome.restored)} report(s).[/green]")
+        elif outcome.text:
+            console.print(
+                f"[yellow]No deleted report of yours matches {_safe(outcome.text)}."
+                "[/yellow] [dim]/reports deleted lists what can be restored.[/dim]"
+            )
+        else:
+            console.print(
+                "[yellow]Nothing deleted in this session to restore.[/yellow] "
+                "[dim]/reports deleted lists older deletions.[/dim]"
+            )
     elif outcome.kind is Kind.TRACE_EVENTS:
         _render_trace_events(outcome)
     elif outcome.kind is Kind.TRACE_TURNS:

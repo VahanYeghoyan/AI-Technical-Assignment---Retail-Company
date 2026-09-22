@@ -16,6 +16,10 @@ Failure handling is deliberately asymmetric, because retrying the wrong error is
 how an agent turns an outage into a bill:
 
   5xx / UNAVAILABLE      transient  -> retry with exponential backoff + jitter
+  network unreachable    transient  -> same
+  no answer in time      timeout    -> no retry on the same model: fall back once.
+                                       Waiting another LLM_TIMEOUT_S for the model
+                                       that just stalled only multiplies the wait.
   429 rate limited       transient  -> retry, then fall back to the smaller model
   429 quota exhausted    FATAL      -> do not retry. More requests cannot succeed;
                                        only a human topping up credits can fix it.
@@ -25,7 +29,9 @@ how an agent turns an outage into a bill:
   401 / 403              FATAL      -> a misconfigured key; surface to the operator
 
 A per-turn call budget caps the blast radius of a self-correction loop that will
-not converge.
+not converge, and a per-request timeout caps how long any one call may take.
+google-genai sets no timeout of its own: without one, a model endpoint that
+accepts the connection and then stalls holds the chat forever.
 """
 
 from __future__ import annotations
@@ -45,6 +51,22 @@ DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 # maybe a self-correction, then compose. Anything past this is a loop.
 DEFAULT_CALL_BUDGET = 8
 
+# Per-request timeout. The slowest call in a live session — writing a saved
+# report from ~27k prompt tokens, with thinking — took well under this.
+DEFAULT_TIMEOUT_S = 60.0
+
+
+def _env_temperature() -> float | None:
+    """GEMINI_TEMPERATURE, or None to use the model's own default.
+
+    Unset by default on purpose: Google's Gemini 3 guide strongly recommends
+    leaving temperature at its default of 1.0, and warns that lower values can
+    cause looping — the failure a bounded self-correction loop exists to
+    contain, not to provoke.
+    """
+    raw = os.getenv("GEMINI_TEMPERATURE", "").strip()
+    return float(raw) if raw else None
+
 
 class LLMError(Exception):
     """Base for model failures."""
@@ -54,6 +76,14 @@ class LLMError(Exception):
 
 class LLMTransientError(LLMError):
     retryable = True
+
+
+class LLMTimeoutError(LLMTransientError):
+    """The model did not answer within the request timeout.
+
+    Transient, so the fallback model gets a chance — but never retried against
+    the model that stalled, since each retry costs another full timeout.
+    """
 
 
 class LLMQuotaError(LLMError):
@@ -99,6 +129,10 @@ class LLMResponse:
     function_calls: tuple[FunctionCall, ...] = ()
     prompt_tokens: int = 0
     output_tokens: int = 0
+    # Gemini 3 reasons before it answers. Those tokens are billed as output but
+    # reported separately from candidates_token_count — reading only that one
+    # undercounted a turn's output by an order of magnitude.
+    thinking_tokens: int = 0
     model: str = ""
     used_fallback: bool = False
 
@@ -128,9 +162,21 @@ def _classify_genai(err: Exception) -> LLMError:
     """Map a google-genai exception to a retry policy."""
     from google.genai import errors as genai_errors
 
-    message = str(err)
+    message = str(err) or type(err).__name__
     lowered = message.lower()
     code = getattr(err, "code", None)
+
+    # Transport failures arrive as raw httpx (or httpx2, a fork google-genai
+    # also accepts) or google.auth exceptions, not as genai APIErrors — so they
+    # fell through to a bare LLMError that was neither retried nor sent to the
+    # fallback. Matched by class name across the MRO to cover both httpx forks.
+    names = {cls.__name__ for cls in type(err).__mro__}
+    if "TimeoutException" in names or isinstance(err, TimeoutError):
+        return LLMTimeoutError(f"the model did not answer in time: {message}")
+    if names & {"TransportError", "NetworkError", "ConnectError"} or isinstance(
+        err, ConnectionError
+    ):
+        return LLMTransientError(message)
 
     if isinstance(err, genai_errors.ServerError) or code in {500, 502, 503, 504}:
         return LLMTransientError(message)
@@ -215,7 +261,10 @@ class GeminiProvider:
             "GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL
         )
     )
-    temperature: float = 0.2
+    temperature: float | None = field(default_factory=_env_temperature)
+    timeout_s: float = field(
+        default_factory=lambda: float(os.getenv("LLM_TIMEOUT_S") or DEFAULT_TIMEOUT_S)
+    )
     max_attempts: int = 3
     call_budget: int = DEFAULT_CALL_BUDGET
     client: Any | None = None
@@ -228,6 +277,10 @@ class GeminiProvider:
             return
 
         from google import genai
+        from google.genai import types
+
+        # Milliseconds. google-genai's default is no timeout at all.
+        http_options = types.HttpOptions(timeout=int(self.timeout_s * 1000))
 
         if self.use_vertex:
             # GOOGLE_CLOUD_PROJECT is an override, not a requirement: without it
@@ -243,7 +296,10 @@ class GeminiProvider:
                 )
             try:
                 self.client = genai.Client(
-                    vertexai=True, project=self.project, location=self.location
+                    vertexai=True,
+                    project=self.project,
+                    location=self.location,
+                    http_options=http_options,
                 )
             except Exception as err:  # noqa: BLE001
                 raise LLMConfigError(
@@ -259,7 +315,7 @@ class GeminiProvider:
                 "Google AI Studio key, set LLM_PROVIDER=vertex to use Application "
                 "Default Credentials instead, or LLM_PROVIDER=stub to run offline."
             )
-        self.client = genai.Client(api_key=key)
+        self.client = genai.Client(api_key=key, http_options=http_options)
 
     def begin_turn(self) -> None:
         """Reset the per-turn call budget."""
@@ -328,8 +384,15 @@ class GeminiProvider:
 
         config: dict[str, Any] = {
             "system_instruction": system,
-            "temperature": self.temperature,
+            # The agent drives the tool loop itself: every call is guarded,
+            # traced and budgeted, which automatic execution would bypass. Set
+            # even without tools, where the SDK otherwise warns on every call.
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
         }
+        if self.temperature is not None:
+            config["temperature"] = self.temperature
         if tools:
             config["tools"] = [
                 types.Tool(
@@ -338,11 +401,6 @@ class GeminiProvider:
                     ]
                 )
             ]
-            # The agent drives the tool loop itself: every call is guarded,
-            # traced and budgeted, which automatic execution would bypass.
-            config["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
-                disable=True
-            )
 
         last: LLMError | None = None
         for attempt in range(1, self.max_attempts + 1):
@@ -354,7 +412,7 @@ class GeminiProvider:
                 )
             except Exception as err:  # noqa: BLE001
                 error = _classify_genai(err)
-                if not error.retryable:
+                if not error.retryable or isinstance(error, LLMTimeoutError):
                     raise error from err
                 last = error
                 if attempt < self.max_attempts:
@@ -393,6 +451,7 @@ def _parse_response(response: Any, *, model: str, used_fallback: bool) -> LLMRes
         function_calls=tuple(calls),
         prompt_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
         output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0),
+        thinking_tokens=int(getattr(usage, "thoughts_token_count", 0) or 0),
         model=model,
         used_fallback=used_fallback,
     )

@@ -116,6 +116,30 @@ def test_report_then_confirmed_delete_then_undo(tmp_path, store):
     assert len(undone.restored) == 1
 
 
+@pytest.mark.parametrize(
+    ("question", "title"),
+    [
+        ("create a report on denim", "Demo report: denim"),
+        ("Create a report for Q1 including action items", "Demo report: Q1"),
+        ("write me a report please", "Demo report: this quarter"),
+    ],
+)
+def test_the_report_topic_is_read_from_the_question(tmp_path, store, question, title):
+    demo_agent(tmp_path, store).ask(question)
+    assert store.list_for_user("maya")[0].title == title
+
+
+def test_the_readme_report_example_can_be_deleted_by_topic(tmp_path, store):
+    # The README says `create a report on denim`; it was saved as "this
+    # quarter", so "delete reports mentioning denim" then matched nothing.
+    agent = demo_agent(tmp_path, store)
+    agent.ask("create a report on denim")
+
+    result = agent.ask("delete all reports mentioning denim")
+
+    assert [r.title for r in result.pending_deletion.targets] == ["Demo report: denim"]
+
+
 def test_delete_mentioning_a_client_matches_on_that_text(tmp_path, store):
     store.save(owner="maya", conversation_id="old", title="Acme Q1", body="x")
     store.save(owner="maya", conversation_id="old", title="Board pack", body="y")

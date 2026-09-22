@@ -36,6 +36,7 @@ from retail_agent.llm import (
     LLMProvider,
     LLMQuotaError,
     LLMResponse,
+    LLMTimeoutError,
 )
 from retail_agent.observability import Tracer
 from retail_agent.prompt import (
@@ -225,6 +226,14 @@ class Agent:
                 "budget. Try narrowing the question — a single metric over a "
                 "single period usually gets there.",
                 status="budget_exhausted",
+                error=err,
+            )
+        except LLMTimeoutError as err:
+            result = self._degrade(
+                "The language model did not respond in time, so I stopped "
+                "waiting rather than hold the conversation. Your data and "
+                "reports are unaffected — please try again shortly.",
+                status="llm_timeout",
                 error=err,
             )
         except LLMError as err:
@@ -529,7 +538,19 @@ class Agent:
                 "unaffected."
             )
             status = "warehouse_permission"
+        elif kind == str(QueryErrorKind.QUOTA):
+            # Not a credentials problem, and saying it was sent operators to
+            # re-run `gcloud auth` against a project that had simply run out.
+            message = (
+                "The Google Cloud project behind the data warehouse has used up "
+                "its BigQuery quota (on the free sandbox, 1 TB of queries a "
+                "month), so I cannot run the analysis. That needs an operator — "
+                "a quota increase or billing — not a different question. Your "
+                "saved reports are unaffected."
+            )
+            status = "warehouse_quota"
         elif kind in {str(QueryErrorKind.TRANSIENT), str(QueryErrorKind.TIMEOUT),
+                      str(QueryErrorKind.UNAVAILABLE),
                       str(QueryErrorKind.CIRCUIT_OPEN)}:
             message = (
                 "The data warehouse is not responding at the moment, so I "
@@ -566,6 +587,7 @@ class Agent:
         self.tracer.metrics.llm_calls += 1
         self.tracer.metrics.prompt_tokens += response.prompt_tokens
         self.tracer.metrics.output_tokens += response.output_tokens
+        self.tracer.metrics.thinking_tokens += response.thinking_tokens
         if response.used_fallback:
             self.tracer.metrics.fallback_model_used = True
         self.tracer.emit(

@@ -29,6 +29,13 @@ Plus three rules regardless of size:
   * Anything else cancels the proposal and is handled as a normal turn. The
     user never has to fight their way out of a prompt.
 
+The match set is only ever resolved against the caller's own library. It used
+to report how many OTHER users' reports also matched ("2 more match but belong
+to someone else"), which turned the delete flow into a search of everyone's
+reports: any user could test whether another executive's reports contain a
+phrase, one proposal at a time. Other people's reports are now invisible here,
+exactly as their traces are invisible to /trace.
+
 Deletes are soft (see reports.py), so even a confirmed mistake is recoverable
 for 30 days — which is what makes the "yes" tier defensible.
 """
@@ -41,7 +48,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Sequence
 
-from retail_agent.reports import DeleteOutcome, Report, ReportStore
+from retail_agent.reports import (
+    RESTORE_WINDOW_DAYS,
+    DeleteOutcome,
+    Report,
+    ReportStore,
+)
 
 # Above this many reports, a bare "yes" is not enough.
 BULK_THRESHOLD = 4
@@ -51,6 +63,17 @@ _AFFIRMATIVE = frozenset(
     {"yes", "y", "yeah", "yep", "confirm", "confirmed", "do it", "go ahead", "delete"}
 )
 _NEGATIVE = frozenset({"no", "n", "cancel", "stop", "abort", "nevermind", "never mind"})
+
+
+def normalise_reply(message: str) -> str:
+    """A reply as it is compared: case, spacing and a trailing "." or "!" do
+    not change what it means."""
+    return message.strip().lower().rstrip("!. ")
+
+
+def is_refusal(message: str) -> bool:
+    """True when the whole reply is a plain no — nothing left to answer."""
+    return normalise_reply(message) in _NEGATIVE
 
 
 class ConfirmationError(RuntimeError):
@@ -64,7 +87,6 @@ class PendingDeletion:
     action_id: str
     actor: str
     targets: tuple[Report, ...]
-    not_owned: tuple[Report, ...]
     criteria: str
     created_at: datetime
     ttl_seconds: int = DEFAULT_TTL_SECONDS
@@ -93,29 +115,19 @@ class PendingDeletion:
                 "you really do mean every one of them."
             )
         if not self.targets:
-            base = f"Nothing matches {self.criteria!r}, so there is nothing to delete."
-            if self.not_owned:
-                base += (
-                    f" ({len(self.not_owned)} report(s) match but belong to someone"
-                    " else, so they are not yours to delete.)"
-                )
-            return base
+            return (
+                f"Nothing in your reports matches {self.criteria!r}, so there is "
+                "nothing to delete."
+            )
 
         lines = [
             f"This will delete {len(self.targets)} saved report(s) matching "
             f"{self.criteria!r}:",
             "",
             *(f"  • {r.summary()}" for r in self.targets),
-        ]
-        if self.not_owned:
-            lines += [
-                "",
-                f"Skipping {len(self.not_owned)} report(s) that match but belong to"
-                " someone else.",
-            ]
-        lines += [
             "",
-            f"Deletes are reversible for 30 days (/undo).",
+            f"Deleted reports can be restored for {RESTORE_WINDOW_DAYS} days "
+            "(/undo, or /reports deleted later).",
             (
                 f"Type 'delete {len(self.targets)}' to confirm."
                 if self.requires_count
@@ -180,7 +192,6 @@ class ConfirmationBroker:
                 action_id=uuid.uuid4().hex[:12],
                 actor=actor,
                 targets=(),
-                not_owned=(),
                 criteria=criteria,
                 created_at=datetime.now(UTC),
                 ttl_seconds=ttl_seconds,
@@ -190,30 +201,20 @@ class ConfirmationBroker:
             # Say what it is, not what the model called it.
             criteria = "ALL of your saved reports"
 
+        # Only ever the actor's own reports: see the module docstring for why
+        # other users' matches are not even counted.
         if report_ids:
-            resolved = [self.store.resolve_id(rid) for rid in report_ids]
+            resolved = [self.store.resolve_id(rid, owner=actor) for rid in report_ids]
             targets = tuple(r for r in resolved if r and not r.is_deleted)
-            not_owned = tuple(r for r in targets if r.owner != actor)
-            targets = tuple(r for r in targets if r.owner == actor)
         else:
             targets = self.store.search(
                 actor=actor, text=text, conversation_id=conversation_id
             )
-            # Everything matching the same criteria that the actor may not touch,
-            # so the user is told rather than silently under-served.
-            everyone = self.store.search(
-                actor=actor,
-                text=text,
-                conversation_id=conversation_id,
-                owned_only=False,
-            )
-            not_owned = tuple(r for r in everyone if r.owner != actor)
 
         pending = PendingDeletion(
             action_id=uuid.uuid4().hex[:12],
             actor=actor,
             targets=targets,
-            not_owned=not_owned,
             criteria=criteria,
             created_at=datetime.now(UTC),
             ttl_seconds=ttl_seconds,
@@ -245,7 +246,7 @@ class ConfirmationBroker:
         if pending is None:
             return "none"
 
-        normalised = message.strip().lower().rstrip("!. ")
+        normalised = normalise_reply(message)
         if normalised in _NEGATIVE:
             return "cancel"
 

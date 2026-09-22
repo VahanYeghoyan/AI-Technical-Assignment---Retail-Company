@@ -398,6 +398,19 @@ def test_scope_with_no_dimensions_is_rejected():
         Scope(user_id="typo")
 
 
+@pytest.mark.parametrize("flag", ['"false"', '"no"', "0", '"true"'])
+def test_a_quoted_unrestricted_flag_is_refused_not_granted(tmp_path, flag):
+    # bool("false") is True: quoting the flag, as people do, granted the
+    # whole catalogue to a user whose scope said Men only.
+    config = tmp_path / "entitlements.yaml"
+    config.write_text(
+        "users:\n  intern:\n    scope:\n"
+        f"      unrestricted: {flag}\n      departments: [Men]\n"
+    )
+    with pytest.raises(ValueError, match="unquoted"):
+        load_scopes(config)
+
+
 def test_scope_description_is_human_readable():
     assert "Women" in WOMENS.describe()
     assert UNRESTRICTED.describe() == "the full product catalogue"

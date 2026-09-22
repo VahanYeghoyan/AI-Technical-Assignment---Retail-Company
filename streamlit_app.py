@@ -46,7 +46,8 @@ HELP_MARKDOWN = """
 | Command | Does |
 |---|---|
 | `/reports` | list your saved reports |
-| `/undo` | restore the reports deleted most recently |
+| `/reports deleted` | deleted reports you can still restore (30 days) |
+| `/undo [id]` | restore the reports just deleted, or one by its id |
 | `/trace [id]` | recent turns, or the full event stream for one turn |
 | `/whoami` | identity, data scope, persona version |
 | `/persona` | show the live persona version |
@@ -107,7 +108,12 @@ def render_answer(outcome: Outcome) -> None:
         f" · sql {metrics.get('sql_attempts', 0)}"
         f" · corrections {metrics.get('sql_self_corrections', 0)}"
         f" · tok {metrics.get('prompt_tokens', 0):,}→{metrics.get('output_tokens', 0):,}"
-        f" · bytes {metrics.get('bq_bytes_billed', 0):,}"
+        + (
+            f" · think {metrics['thinking_tokens']:,}"
+            if metrics.get("thinking_tokens")
+            else ""
+        )
+        + f" · bytes billed {metrics.get('bq_bytes_billed', 0):,}"
         f" · trace `{result.trace_id}`"
     )
     st.caption(summary)
@@ -162,27 +168,42 @@ def render_outcome(agent: Agent, outcome: Outcome) -> None:
         st.markdown(HELP_MARKDOWN)
 
     elif kind is Kind.REPORTS:
+        deleted = outcome.text == "deleted"
         if not outcome.reports:
-            st.caption("No saved reports yet.")
+            st.caption(
+                "No deleted reports to restore." if deleted else "No saved reports yet."
+            )
         else:
             st.dataframe(
                 [
                     {
                         "id": r.report_id[:8],
                         "title": r.title,
-                        "created": r.created_at[:10],
+                        ("deleted" if deleted else "created"): (
+                            r.deleted_at if deleted else r.created_at
+                        )[:10],
                     }
                     for r in outcome.reports
                 ],
                 hide_index=True,
                 width="stretch",
             )
+            if deleted:
+                st.caption("`/undo <id>` restores one.")
 
     elif kind is Kind.UNDO:
         if outcome.restored:
             st.success(f"Restored {len(outcome.restored)} report(s).")
+        elif outcome.text:
+            st.warning(
+                f"No deleted report of yours matches `{outcome.text}` — "
+                "`/reports deleted` lists what can be restored."
+            )
         else:
-            st.warning("Nothing to restore.")
+            st.warning(
+                "Nothing deleted in this session to restore — `/reports deleted` "
+                "lists older deletions."
+            )
 
     elif kind is Kind.TRACE_TURNS:
         if not outcome.turns:

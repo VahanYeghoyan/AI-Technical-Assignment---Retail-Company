@@ -8,9 +8,7 @@ __pycache__/
 # Secrets — never commit
 .env
 
-# Local state (SQLite: saved reports, sessions, traces)
-data/*.db
-data/*.db-journal
+# Local state: saved reports (var/reports.db) and traces (var/traces/)
 var/
 
 # The Google Cloud SDK installer unpacks into the directory it is run from. If

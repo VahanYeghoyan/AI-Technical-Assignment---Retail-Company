@@ -16,7 +16,8 @@ promise a regulator.
 flowchart TB
     subgraph clients["Clients"]
         CLI["CLI chat<br/><i>this prototype</i>"]
-        WEB["Web / Slack<br/><i>future</i>"]
+        WEB["Web UI — Streamlit<br/><i>this prototype, optional</i>"]
+        SLACK["Slack<br/><i>future</i>"]
     end
 
     subgraph edge["Edge"]
@@ -53,6 +54,7 @@ flowchart TB
 
     CLI --> IAP
     WEB --> IAP
+    SLACK --> IAP
     IAP --> API --> ORCH
 
     ORCH <--> GEM
@@ -87,7 +89,7 @@ flowchart TB
 | Concern | Choice | Reasoning |
 |---|---|---|
 | Compute | **Cloud Run** | Request-shaped, bursty, scales to zero. A chat turn is seconds of CPU; GKE's operational weight buys nothing here. |
-| Model | **Gemini 3.6 Flash**, fallback **3.1 Flash-Lite** | Verified live on 2026-09-18; 2.5-* are retired for new keys and the API redirects to 3.6. Flash is the right tier for SQL generation and summarisation; Pro is reserved for multi-step "why" analyses if eval justifies the cost. |
+| Model | **Gemini 3.6 Flash**, fallback **3.1 Flash-Lite** | Verified live on 2026-09-18; 2.5-* are retired for new keys and the API redirects to 3.6. Flash is the right tier for SQL generation and summarisation; Pro is reserved for multi-step "why" analyses if eval justifies the cost. Temperature is left at the model's default of 1.0, as Google's Gemini 3 guidance recommends — lower values can make it loop. |
 | Model access | **Vertex AI via ADC**, not an AI Studio key | Access becomes IAM rather than a bearer secret — no key to mint, store, rotate or leak, and the workload already needs those credentials for BigQuery. It also bills through the project rather than a prepaid pool that fails closed on every model at once, which is precisely what happened to this project's AI Studio key mid-build. |
 | Warehouse | **BigQuery** | The dataset is already there; separation of storage and compute means per-query cost caps are enforceable server-side. |
 | Access control | **Authorized views + row-level access policies** | Moves entitlements *into* the database. The agent then cannot over-read even if the application layer is compromised. |
@@ -211,8 +213,13 @@ Implemented — see the README for the enforced rules. Production additions:
 Implemented. The design point worth restating: strictness is proportional to
 blast radius, and **soft deletion is what makes a friendly confirmation tier
 defensible**. Above three reports a bare "yes" is answered with the count to
-type rather than taken, and the proposal stays open. In production, deletions of 25+ reports additionally require a
-second approver, and Firestore TTL purges soft-deleted rows after 30 days.
+type rather than taken, and the proposal stays open. The 30-day window is
+reachable from any later session (`/reports deleted`, `/undo <id>`), not only
+from the one that deleted. A match set is resolved against the caller's own
+library only — counting other users' matches, even without naming them, let
+anyone test what another executive's reports say. In production, deletions of
+25+ reports additionally require a second approver, and Firestore TTL purges
+soft-deleted rows after 30 days.
 
 ### 3.4 Continuous improvement
 
@@ -243,8 +250,9 @@ regional Cloud Run failover, a fallback from the `global` Vertex AI endpoint to
 a regional one for provider-level outages, request hedging on p99 latency, and
 idempotency keys so a retried report-save cannot duplicate.
 
-**Two failure modes worth recording, because both were invisible to a fully
-green test suite and only appeared against live services.**
+**Three failure modes worth recording, because all three were invisible to a
+fully green test suite: the first two appeared only against live services, the
+third only against the real client libraries.**
 
 *Thought signatures.* Gemini 3.x returns an opaque `thought_signature` on each
 function-call part and requires it echoed back verbatim when that call appears in
@@ -268,6 +276,19 @@ error, an unknown column), because a rewrite can fix exactly that — bounded to
 3 repairs. Retries are reserved for 5xx, timeouts and rate limits.
 Misclassifying here is how a self-correction loop quietly becomes a cost
 incident, which is the exact failure Requirement 5 warns about.
+
+*The SDKs' own defaults.* Neither client library bounds its waits the way this
+design assumes. google-genai sets no request timeout, so a model endpoint that
+accepts a connection and stalls holds the chat indefinitely. google-cloud-bigquery
+retries for up to 10 minutes per call and re-runs failed jobs for up to 40,
+underneath the classifier and the breaker. Measured against a dead endpoint, a
+query hung for 19 minutes, surfaced as an unclassifiable `RetryError`, and the
+breaker never counted it. Every call now carries an explicit bound — a 60 s
+model timeout with no retry of the model that stalled, and a 10 s library retry
+budget for BigQuery — and a `RetryError` is classified as the outage it is.
+Both are covered by contract tests that drive the real client libraries
+against a local dead endpoint, because a fake client has no defaults to get
+wrong.
 
 ### 3.6 Quality assurance
 
@@ -310,7 +331,7 @@ Implemented in prototype form. Metrics to alert on, at the agent level:
 | Refusals (policy blocks: PII, whole-row, write, unselective delete) | someone probing, as distinct from the model fumbling SQL | any spike, per user |
 | PII redaction count at output | **should be ~0**; non-zero means a layer failed | any sustained non-zero |
 | p95 latency | UX | > 45 s |
-| Tokens & bytes billed per turn | cost | > 2× 7-day baseline |
+| Tokens (incl. thinking) & bytes billed per turn | cost — Gemini 3's thinking tokens are billed as output but reported separately, and can outnumber the answer's by 10× | > 2× 7-day baseline |
 | Quota/circuit events | dependency health | any |
 | Empty-result rate | question/data mismatch | > 15% |
 
@@ -360,6 +381,7 @@ New capabilities are tools; the orchestrator does not change.
 
 | Concern | Prototype | Production |
 |---|---|---|
+| Front ends | CLI + optional Streamlit UI, one shared `dispatch.py` | Web app and Slack behind IAP, same dispatch contract |
 | Entitlements | sqlglot rewriting in-process | + authorized views, RLS |
 | Reports | SQLite | Firestore + TTL |
 | Sessions | in-memory, trimmed | Firestore, summarised |

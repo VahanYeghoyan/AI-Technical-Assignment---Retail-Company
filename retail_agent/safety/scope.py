@@ -82,6 +82,23 @@ def _as_frozenset(raw: object) -> frozenset[str]:
     raise ValueError(f"expected a list of strings, got {type(raw).__name__}")
 
 
+def _as_flag(raw: object, *, user_id: str) -> bool:
+    """A YAML boolean, strictly.
+
+    bool() of any non-empty string is True, so `unrestricted: "false"` — quoted,
+    as people do — granted the full catalogue: the one typo this file must not
+    turn into access. Anything but a real boolean is refused.
+    """
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    raise ValueError(
+        f"user {user_id!r}: 'unrestricted' must be true or false (unquoted), "
+        f"got {raw!r} — refusing to guess at an access grant"
+    )
+
+
 def load_scopes(config_path: Path | str | None = None) -> dict[str, Scope]:
     """Parse entitlements.yaml into Scope objects, keyed by user id."""
     path = Path(config_path or os.getenv("ENTITLEMENTS_PATH") or _DEFAULT_CONFIG)
@@ -93,7 +110,7 @@ def load_scopes(config_path: Path | str | None = None) -> dict[str, Scope]:
             user_id=user_id,
             display_name=(entry or {}).get("display_name", ""),
             title=(entry or {}).get("title", ""),
-            unrestricted=bool(raw_scope.get("unrestricted", False)),
+            unrestricted=_as_flag(raw_scope.get("unrestricted"), user_id=user_id),
             departments=_as_frozenset(raw_scope.get("departments")),
             categories=_as_frozenset(raw_scope.get("categories")),
             brands=_as_frozenset(raw_scope.get("brands")),
